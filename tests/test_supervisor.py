@@ -5,7 +5,7 @@ from pathlib import Path
 
 from llm_setup.process import process_matches
 from llm_setup.profile import load_profile
-from llm_setup.supervisor import _command, render_litellm
+from llm_setup.supervisor import _command, _failure_hint, _vllm_environment, render_litellm
 
 
 def test_litellm_config_has_aliases_without_cross_role_fallback(monkeypatch):
@@ -46,3 +46,23 @@ def test_embedding_launch_uses_pooling_runner(monkeypatch):
     command = _command("embed", data["models"]["embed"], Path("runtime/test"))
     assert command[command.index("--runner") + 1] == "pooling"
     assert "--task" not in command
+
+
+def test_vllm_environment_disables_flashinfer_sampler_without_toolkit():
+    env = _vllm_environment({"LITELLM_MASTER_KEY": "secret", "HF_TOKEN": "hf-secret"},
+                            {"gpu": 2}, "session-1")
+    assert env["VLLM_USE_FLASHINFER_SAMPLER"] == "0"
+    assert env["CUDA_VISIBLE_DEVICES"] == "2"
+    assert env["HF_TOKEN"] == "hf-secret"
+    assert "LITELLM_MASTER_KEY" not in env
+
+
+def test_vllm_environment_respects_explicit_flashinfer_opt_in():
+    env = _vllm_environment({"VLLM_USE_FLASHINFER_SAMPLER": "1"}, {"gpu": 0}, "session-1")
+    assert env["VLLM_USE_FLASHINFER_SAMPLER"] == "1"
+
+
+def test_startup_failure_names_missing_cuda_compiler(tmp_path):
+    log = tmp_path / "heavy.log"
+    log.write_text("RuntimeError: Could not find nvcc and default cuda_home='/usr/local/cuda' doesn't exist")
+    assert "VLLM_USE_FLASHINFER_SAMPLER=1" in _failure_hint(log)

@@ -49,11 +49,47 @@ def _command(role: str, item: dict[str, Any], session: Path) -> list[str]:
     return command
 
 
-def _wait_health(url: str, process: subprocess.Popen[Any], timeout: int = 1800) -> None:
+def _vllm_environment(base: dict[str, str], item: dict[str, Any], session_id: str) -> dict[str, str]:
+    child_env = base.copy()
+    child_env.pop("LITELLM_MASTER_KEY", None)
+    child_env.pop("LLM_BACKEND_KEY", None)
+    child_env.pop("VLLM_API_KEY", None)
+    child_env["HF_TOKEN"] = base.get("HF_TOKEN", "")
+    child_env["LLM_SETUP_SESSION_ID"] = session_id
+    child_env["CUDA_VISIBLE_DEVICES"] = str(item["gpu"])
+    # FlashInfer's sampler JIT-compiles on first request and requires nvcc. Many
+    # Slurm runtime images have CUDA drivers but not the CUDA toolkit. The native
+    # PyTorch sampler avoids that runtime compiler dependency. Operators may
+    # explicitly opt back in when nvcc and a compatible toolkit are available.
+    child_env.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
+    return child_env
+
+
+def _failure_hint(log_path: Path | None) -> str:
+    if log_path is None:
+        return ""
+    try:
+        tail = log_path.read_text(encoding="utf-8", errors="replace")[-16000:]
+    except OSError:
+        return ""
+    if "Could not find nvcc" in tail:
+        return (
+            "; FlashInfer sampler JIT failed because nvcc is unavailable. "
+            "Native PyTorch sampling is now enabled by default; set "
+            "VLLM_USE_FLASHINFER_SAMPLER=1 only when a compatible CUDA toolkit is installed"
+        )
+    return ""
+
+
+def _wait_health(url: str, process: subprocess.Popen[Any], timeout: int = 1800,
+                 log_path: Path | None = None) -> None:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if process.poll() is not None:
-            raise RuntimeError(f"process exited with status {process.returncode} before {url} became healthy")
+            hint = _failure_hint(log_path)
+            raise RuntimeError(
+                f"process exited with status {process.returncode} before {url} became healthy{hint}"
+            )
         try:
             if httpx.get(url, timeout=2).is_success:
                 return
@@ -88,19 +124,14 @@ def start(profile_path: str | Path, profile: dict[str, Any], env: dict[str, str]
         for role in ("embed", "heavy", "lite"):
             item = profile["models"][role]
             command = _command(role, item, session)
-            child_env = os.environ.copy()
-            child_env.pop("LITELLM_MASTER_KEY", None)
-            child_env.pop("LLM_BACKEND_KEY", None)
-            child_env.pop("VLLM_API_KEY", None)
-            child_env["HF_TOKEN"] = env.get("HF_TOKEN", "")
-            child_env["LLM_SETUP_SESSION_ID"] = session_id
-            child_env["CUDA_VISIBLE_DEVICES"] = str(item["gpu"])
-            log = (session / f"{role}.log").open("ab")
+            child_env = _vllm_environment({**os.environ, **env}, item, session_id)
+            log_path = session / f"{role}.log"
+            log = log_path.open("ab")
             process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, env=child_env,
                                        start_new_session=True)
             records[role] = {"pid": process.pid, "command": command, "log": str(session / f"{role}.log")}
             _save_records(session, session_id, records)
-            _wait_health(f"http://127.0.0.1:{item['port']}/health", process)
+            _wait_health(f"http://127.0.0.1:{item['port']}/health", process, log_path=log_path)
         litellm_command = ["litellm", "--config", str(litellm_path), "--host", "127.0.0.1",
                            "--port", str(profile["gateway"]["port"])]
         gateway_env = os.environ.copy()

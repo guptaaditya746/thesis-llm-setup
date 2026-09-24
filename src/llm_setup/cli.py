@@ -30,6 +30,14 @@ def _active_session() -> Path | None:
     return Path("runtime") / session_id
 
 
+def _gateway_aliases(port: int, key: str) -> set[str]:
+    headers = {"Authorization": f"Bearer {key}"} if key else {}
+    response = httpx.get(f"http://127.0.0.1:{port}/v1/models", headers=headers, timeout=3)
+    if not response.is_success:
+        return set()
+    return {entry.get("id") for entry in response.json().get("data", [])}
+
+
 def _verify(profile_path: str) -> int:
     profile = load_profile(profile_path)
     try:
@@ -67,8 +75,7 @@ def _verify(profile_path: str) -> int:
                 print(f"{alias} {endpoint}: unreachable")
                 all_ok = False
     try:
-        response = httpx.get(f"http://127.0.0.1:{profile['gateway']['port']}/v1/models", timeout=3)
-        found = {entry.get("id") for entry in response.json().get("data", [])} if response.is_success else set()
+        found = _gateway_aliases(profile["gateway"]["port"], os.getenv("LITELLM_MASTER_KEY", ""))
         for alias in aliases:
             okay = alias in found
             print(f"LiteLLM alias {alias}: {'reachable' if okay else 'missing'}")
