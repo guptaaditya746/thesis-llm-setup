@@ -1,0 +1,8 @@
+# Generated at runtime from the selected profile. Stable aliases only.
+model_list: []
+litellm_settings:
+  num_retries: 2
+  request_timeout: 120
+  fallbacks: []
+router_settings:
+  fallbacks: []

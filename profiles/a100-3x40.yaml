@@ -1,0 +1,39 @@
+name: a100-3x40
+bind_host: 127.0.0.1
+gateway:
+  host: 127.0.0.1
+  port: 4000
+status:
+  host: 127.0.0.1
+  port: 8010
+models:
+  heavy:
+    alias: heavy-model
+    model: Qwen/Qwen3-30B-A3B-Instruct-2507-FP8
+    gpu: 0
+    port: 8002
+    max_num_active_seqs: 4
+    max_num_queued_reqs: 8
+    max_model_len: 32768
+    gpu_memory_utilization: 0.92
+  lite:
+    alias: lite-model
+    model: ibm-granite/granite-4.1-8b
+    gpu: 1
+    port: 8003
+    max_num_active_seqs: 8
+    max_num_queued_reqs: 16
+    max_model_len: 32768
+    gpu_memory_utilization: 0.90
+  embed:
+    alias: qwen-embed
+    model: Qwen/Qwen3-Embedding-0.6B
+    gpu: 2
+    port: 8001
+    max_num_active_seqs: 32
+    max_num_queued_reqs: 64
+    max_model_len: 8192
+    gpu_memory_utilization: 0.85
+    task: embed
+storage:
+  database: runtime/status.sqlite3
