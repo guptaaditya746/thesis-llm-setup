@@ -42,3 +42,35 @@ def test_queue_configuration_must_be_finite_and_profile_fields_supported():
 
 def test_profile_yaml_is_valid():
     yaml.safe_load(Path("profiles/a100-3x40.yaml").read_text(encoding="utf-8"))
+
+
+def test_vllm_help_check_allows_slow_shared_filesystem_startup(monkeypatch):
+    from types import SimpleNamespace
+
+    from llm_setup.profile import validate_vllm_options
+
+    monkeypatch.setattr("llm_setup.profile.shutil.which", lambda _name: "/env/bin/vllm")
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append((command, kwargs["timeout"]))
+        flags = "--host --port --gpu-memory-utilization --max-model-len --max-num-seqs " \
+                "--served-model-name --runner {auto,draft,generate,pooling} --tensor-parallel-size"
+        return SimpleNamespace(stdout=flags, stderr="", returncode=0)
+
+    monkeypatch.setattr("llm_setup.profile.subprocess.run", run)
+    validate_vllm_options()
+    assert calls == [(["/env/bin/vllm", "serve", "--help=all"], 600)]
+
+
+def test_vllm_help_timeout_has_actionable_error(monkeypatch):
+    import subprocess
+
+    from llm_setup.profile import validate_vllm_options
+
+    monkeypatch.setattr("llm_setup.profile.shutil.which", lambda _name: "/env/bin/vllm")
+    monkeypatch.setattr("llm_setup.profile.subprocess.run",
+                        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                            subprocess.TimeoutExpired("vllm serve --help", 600)))
+    with pytest.raises(ProfileError, match="no services were started"):
+        validate_vllm_options()

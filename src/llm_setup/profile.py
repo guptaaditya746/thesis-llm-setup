@@ -13,6 +13,7 @@ import yaml
 
 ALIASES = {"heavy": "heavy-model", "lite": "lite-model", "embed": "qwen-embed"}
 _ENV = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)\}")
+_DEFAULT_VLLM_HELP_TIMEOUT_SECONDS = 600
 
 
 class ProfileError(ValueError):
@@ -105,18 +106,34 @@ def validate_vllm_options() -> set[str]:
     executable = shutil.which("vllm")
     if not executable:
         raise ProfileError("vLLM is not installed or vllm is not on PATH")
+    timeout_value = os.environ.get(
+        "LLM_SETUP_VLLM_HELP_TIMEOUT_SECONDS", str(_DEFAULT_VLLM_HELP_TIMEOUT_SECONDS)
+    )
     try:
-        result = subprocess.run([executable, "serve", "--help"], capture_output=True,
-                                text=True, check=False, timeout=45)
+        timeout_seconds = float(timeout_value)
+    except ValueError as exc:
+        raise ProfileError("LLM_SETUP_VLLM_HELP_TIMEOUT_SECONDS must be a number") from exc
+    if not 1 <= timeout_seconds <= 3600:
+        raise ProfileError("LLM_SETUP_VLLM_HELP_TIMEOUT_SECONDS must be between 1 and 3600")
+    try:
+        result = subprocess.run([executable, "serve", "--help=all"], capture_output=True,
+                                text=True, check=False, timeout=timeout_seconds)
     except subprocess.TimeoutExpired as exc:
-        raise ProfileError("timed out running vllm serve --help; no services were started") from exc
+        raise ProfileError(
+            f"timed out after {timeout_seconds:g}s running vllm serve --help=all; "
+            "increase LLM_SETUP_VLLM_HELP_TIMEOUT_SECONDS if shared-filesystem imports are slow or blocked; "
+            "no services were started"
+        ) from exc
     help_text = result.stdout + result.stderr
     if result.returncode:
         raise ProfileError(f"could not inspect vllm serve --help: {help_text[-1000:]}")
     required = {"--host", "--port", "--gpu-memory-utilization", "--max-model-len", "--max-num-seqs",
-                "--served-model-name", "--task", "--tensor-parallel-size"}
+                "--served-model-name", "--runner", "--tensor-parallel-size"}
     available = {flag for flag in required if flag in help_text}
     missing = sorted(required - available)
     if missing:
         raise ProfileError("installed vLLM does not support required options: " + ", ".join(missing))
+    runner = re.search(r"--runner\s+\{([^}]+)}", help_text)
+    if not runner or "pooling" not in runner.group(1).split(","):
+        raise ProfileError("installed vLLM does not support the pooling runner required for embeddings")
     return available

@@ -45,7 +45,7 @@ def _command(role: str, item: dict[str, Any], session: Path) -> list[str]:
                "--max-model-len", str(item["max_model_len"]),
                "--max-num-seqs", str(item["max_num_active_seqs"])]
     if role == "embed":
-        command += ["--task", "embed"]
+        command += ["--runner", "pooling"]
     return command
 
 

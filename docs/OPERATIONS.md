@@ -6,7 +6,15 @@ Request one allocation:
 srun --gres=gpu:ampere:3 --cpus-per-task=16 --mem=64g --time=48:00:00 --pty bash -l
 ```
 
-Run `uv sync --extra serve`, set `EMBED_MODEL_ID` to a real model ID in `.env`, then export the file and start with `uv run llm-setup start --profile profiles/a100-3x40.yaml`. Startup order is Embed vLLM, Heavy vLLM, Lite vLLM, LiteLLM, then status API. Each backend must pass `/health` before its dependent service starts. All listeners bind to `127.0.0.1`.
+Keep the Python environment, managed Python, and uv cache on node-local scratch. The example `.env` sets these paths using `SLURM_TMPDIR`, or `/tmp` when that variable is unavailable. After sourcing `.env`, install the local Python and serving dependencies:
+
+```sh
+mkdir -p "$LLM_SETUP_LOCAL_ROOT"
+uv python install 3.13
+uv sync --python 3.13 --extra serve
+```
+
+This avoids importing Torch and vLLM from the shared Ceph filesystem, where CLI startup can block on file reads. Model weights remain in the Hugging Face cache and are not copied by setup. Set `EMBED_MODEL_ID` only if selecting a different embedding model. Then start with `uv run llm-setup start --profile profiles/a100-3x40.yaml`. Startup order is Embed vLLM, Heavy vLLM, Lite vLLM, LiteLLM, then status API. Each backend must pass `/health` before its dependent service starts. All listeners bind to `127.0.0.1`.
 
 Useful commands:
 

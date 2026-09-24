@@ -1,6 +1,11 @@
+import os
+import subprocess
+import time
+from pathlib import Path
+
 from llm_setup.process import process_matches
 from llm_setup.profile import load_profile
-from llm_setup.supervisor import render_litellm
+from llm_setup.supervisor import _command, render_litellm
 
 
 def test_litellm_config_has_aliases_without_cross_role_fallback(monkeypatch):
@@ -21,10 +26,6 @@ def test_litellm_config_has_aliases_without_cross_role_fallback(monkeypatch):
 
 
 def test_pid_ownership_requires_exact_session_marker():
-    import os
-    import subprocess
-    import time
-
     environment = os.environ.copy()
     environment["LLM_SETUP_SESSION_ID"] = "owned-session"
     process = subprocess.Popen(["sleep", "5"], env=environment)
@@ -37,3 +38,11 @@ def test_pid_ownership_requires_exact_session_marker():
     finally:
         process.terminate()
         process.wait(timeout=5)
+
+
+def test_embedding_launch_uses_pooling_runner(monkeypatch):
+    monkeypatch.setenv("EMBED_MODEL_ID", "org/embed")
+    data = load_profile("profiles/a100-3x40.yaml")
+    command = _command("embed", data["models"]["embed"], Path("runtime/test"))
+    assert command[command.index("--runner") + 1] == "pooling"
+    assert "--task" not in command
