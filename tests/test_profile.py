@@ -99,7 +99,35 @@ def test_vllm_help_check_requires_kv_cache_flag_only_when_used(monkeypatch):
     monkeypatch.setattr("llm_setup.profile.subprocess.run",
                         lambda *_a, **_k: SimpleNamespace(stdout=flags, stderr="", returncode=0))
     data = profile()
+    for item in data["models"].values():
+        item.pop("tool_call_parser", None)
     with pytest.raises(ProfileError, match="--kv-cache-dtype"):
         validate_vllm_options(data)
     data["models"]["heavy"]["kv_cache_dtype"] = "auto"
     validate_vllm_options(data)
+
+
+def test_tool_call_parser_is_validated_against_the_installed_vllm(monkeypatch):
+    from types import SimpleNamespace
+
+    from llm_setup.profile import validate_vllm_options
+
+    base = "--host --port --gpu-memory-utilization --max-model-len --max-num-seqs " \
+           "--served-model-name --runner {auto,draft,generate,pooling} --tensor-parallel-size " \
+           "--kv-cache-dtype --enable-auto-tool-choice"
+    help_text = {"value": base + " --tool-call-parser {granite,granite4,hermes}"}
+    monkeypatch.setattr("llm_setup.profile.shutil.which", lambda _name: "/env/bin/vllm")
+    monkeypatch.setattr("llm_setup.profile.subprocess.run",
+                        lambda *_a, **_k: SimpleNamespace(stdout=help_text["value"], stderr="", returncode=0))
+    data = profile()
+    validate_vllm_options(data)
+    data["models"]["lite"]["tool_call_parser"] = "granite9"
+    with pytest.raises(ProfileError, match="granite9"):
+        validate_vllm_options(data)
+    help_text["value"] = base
+    with pytest.raises(ProfileError, match="--tool-call-parser"):
+        validate_vllm_options(profile())
+    data = profile()
+    data["models"]["embed"]["tool_call_parser"] = "hermes"
+    with pytest.raises(ProfileError, match="unsupported fields"):
+        validate_profile(data)

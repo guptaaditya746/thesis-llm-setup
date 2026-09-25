@@ -11,3 +11,4 @@
 | Embedding backend unavailable | embed log, `EMBED_MODEL_ID`, `/health` | Confirm exact model ID, access, and embedding task support. |
 | Stale PID state | `verify` reports stale/not owned | `stop` only signals matching session-marked processes. Remove stale runtime state manually only after checking the exact session. |
 | Slurm allocation ending | Slurm time remaining and service logs | Run `llm-setup stop`, then preserve needed non-sensitive diagnostics before allocation exit. |
+| Agent requests fail with HTTP 400 `"auto" tool choice requires --enable-auto-tool-choice and --tool-call-parser` | The backend was started without a tool-call parser | Set `tool_call_parser` for the role in the profile (Lite: `granite4`), then `llm-setup stop` and `start`. `llm-setup smoke` tests tool calling. |

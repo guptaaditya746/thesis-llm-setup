@@ -17,6 +17,8 @@ _DEFAULT_VLLM_HELP_TIMEOUT_SECONDS = 600
 # KV-cache storage types accepted by vLLM's --kv-cache-dtype. "auto" keeps the
 # model's own dtype; the FP8 variants roughly double the tokens that fit.
 KV_CACHE_DTYPES = {"auto", "fp8", "fp8_e4m3", "fp8_e5m2"}
+# vLLM tool-call parser names look like "hermes", "granite4", "granite-20b-fc".
+_PARSER_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
 
 
 class ProfileError(ValueError):
@@ -64,7 +66,7 @@ def validate_profile(data: Any) -> None:
         if role == "embed":
             supported_fields.add("task")
         else:
-            supported_fields.add("kv_cache_dtype")
+            supported_fields.update({"kv_cache_dtype", "tool_call_parser"})
         unknown = set(model) - supported_fields
         if unknown:
             raise ProfileError(f"unsupported fields for models.{role}: {', '.join(sorted(unknown))}")
@@ -90,6 +92,9 @@ def validate_profile(data: Any) -> None:
             raise ProfileError(
                 f"models.{role}.kv_cache_dtype must be one of: {', '.join(sorted(KV_CACHE_DTYPES))}"
             )
+        parser = model.get("tool_call_parser")
+        if parser is not None and (not isinstance(parser, str) or not _PARSER_NAME.fullmatch(parser)):
+            raise ProfileError(f"models.{role}.tool_call_parser must be a vLLM parser name such as hermes")
         used_gpus.add(model["gpu"])
         used_ports.add(model["port"])
     if not isinstance(data.get("gateway"), dict) or not isinstance(data.get("status"), dict):
@@ -115,6 +120,13 @@ def uses_kv_cache_dtype(profile: dict[str, Any] | None) -> bool:
     if not profile:
         return False
     return any(item.get("kv_cache_dtype", "auto") != "auto" for item in profile["models"].values())
+
+
+def tool_call_parsers(profile: dict[str, Any] | None) -> set[str]:
+    """Tool-call parsers the profile asks for (roles that serve tool calling)."""
+    if not profile:
+        return set()
+    return {item["tool_call_parser"] for item in profile["models"].values() if item.get("tool_call_parser")}
 
 
 def validate_vllm_options(profile: dict[str, Any] | None = None) -> set[str]:
@@ -147,10 +159,18 @@ def validate_vllm_options(profile: dict[str, Any] | None = None) -> set[str]:
                 "--served-model-name", "--runner", "--tensor-parallel-size"}
     if uses_kv_cache_dtype(profile):
         required.add("--kv-cache-dtype")
+    parsers = tool_call_parsers(profile)
+    if parsers:
+        required.update({"--enable-auto-tool-choice", "--tool-call-parser"})
     available = {flag for flag in required if flag in help_text}
     missing = sorted(required - available)
     if missing:
         raise ProfileError("installed vLLM does not support required options: " + ", ".join(missing))
+    listed = re.search(r"--tool-call-parser\s+\{([^}]+)}", help_text)
+    if parsers and listed:
+        unknown = parsers - {name.strip() for name in listed.group(1).split(",")}
+        if unknown:
+            raise ProfileError("installed vLLM has no tool-call parser named: " + ", ".join(sorted(unknown)))
     runner = re.search(r"--runner\s+\{([^}]+)}", help_text)
     if not runner or "pooling" not in runner.group(1).split(","):
         raise ProfileError("installed vLLM does not support the pooling runner required for embeddings")

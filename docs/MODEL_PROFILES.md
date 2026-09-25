@@ -19,6 +19,17 @@ The KV cache limits how many tokens can be in flight at once, which matters more
 
 Heavy therefore uses `kv_cache_dtype: fp8`, which roughly doubles its capacity. Allowed values are `auto` (default, the model dtype), `fp8`, `fp8_e4m3` and `fp8_e5m2`; the embedding role does not accept the field. FP8 KV can shift outputs slightly: compare quality on the gold set, and set `auto` to go back. After a change, check the startup log again and watch `preemptions` in `/v1/status`: a rising count under load means too many long requests run at once.
 
+## Tool calling
+
+The harness agent loop sends OpenAI-style `tools` with `tool_choice: "auto"` to `lite-model`. vLLM rejects such requests (HTTP 400, "auto tool choice requires --enable-auto-tool-choice and --tool-call-parser") unless the backend was started with a parser, so chat roles take `tool_call_parser`:
+
+| Role | Parser | Why |
+| --- | --- | --- |
+| Lite (Granite 4.1) | `granite4` | Runs the agent tool loop |
+| Heavy (Qwen3-2507) | `hermes` | Qwen's chat template uses Hermes-style tool calls; not needed today, available if a Heavy agent is configured |
+
+The launcher then adds `--enable-auto-tool-choice --tool-call-parser <name>`, and `verify` checks the parser exists in the installed vLLM. `smoke` sends one tool-calling request per such role.
+
 ## Validation
 
 Validation rejects unknown profile fields, zero or unbounded queue settings, and unknown KV-cache dtypes, and checks the required vLLM flags (including `--kv-cache-dtype` when used) against the installed CLI before launch. Active and queued limits are configurable positive integers. Benchmark representative requests before increasing context, GPU memory use, or concurrency (see `OPERATIONS.md`, "Load test"). Queue admission must remain finite.

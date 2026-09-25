@@ -80,3 +80,18 @@ def test_kv_cache_dtype_is_passed_to_chat_backends_only(monkeypatch):
     assert "--kv-cache-dtype" not in lite
     embed = _command("embed", data["models"]["embed"], Path("runtime/test"))
     assert "--kv-cache-dtype" not in embed
+
+
+def test_tool_call_parser_enables_auto_tool_choice(monkeypatch):
+    monkeypatch.setenv("EMBED_MODEL_ID", "org/embed")
+    data = load_profile("profiles/a100-3x40.yaml")
+    lite = _command("lite", data["models"]["lite"], Path("runtime/test"))
+    assert "--enable-auto-tool-choice" in lite
+    assert lite[lite.index("--tool-call-parser") + 1] == "granite4"
+    heavy = _command("heavy", data["models"]["heavy"], Path("runtime/test"))
+    assert heavy[heavy.index("--tool-call-parser") + 1] == "hermes"
+    embed = _command("embed", data["models"]["embed"], Path("runtime/test"))
+    assert "--tool-call-parser" not in embed
+    plain = _command("lite", {k: v for k, v in data["models"]["lite"].items() if k != "tool_call_parser"},
+                     Path("runtime/test"))
+    assert "--enable-auto-tool-choice" not in plain

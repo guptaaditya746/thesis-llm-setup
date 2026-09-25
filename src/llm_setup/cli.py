@@ -41,7 +41,7 @@ def _gateway_aliases(port: int, key: str) -> set[str]:
 def _verify(profile_path: str) -> int:
     profile = load_profile(profile_path)
     try:
-        validate_vllm_options()
+        validate_vllm_options(profile)
         vllm = "available"
     except ProfileError as exc:
         vllm = str(exc)
@@ -111,7 +111,44 @@ def _smoke(profile_path: str) -> int:
             elapsed = time.monotonic() - started
             print(f"{alias} backend={backend} elapsed={elapsed:.2f}s {'OK' if success else 'FAILED'} {detail}")
             failures += not success
+        failures += _smoke_tool_calls(client, base, profile)
     return int(bool(failures))
+
+
+TOOL_SMOKE = {
+    "messages": [{"role": "user", "content": "What is the weather in Berlin? Use the tool."}],
+    "tools": [{"type": "function", "function": {
+        "name": "get_weather", "description": "Current weather for a city.",
+        "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]},
+    }}],
+    "tool_choice": "auto",
+    "max_tokens": 64,
+    "temperature": 0,
+}
+
+
+def _smoke_tool_calls(client: httpx.Client, base: str, profile: dict) -> int:
+    """One tool-calling request per role that serves a tool-call parser (the agent loop needs it)."""
+    failures = 0
+    for role, item in profile["models"].items():
+        if role == "embed" or not item.get("tool_call_parser"):
+            continue
+        alias = item["alias"]
+        started = time.monotonic()
+        try:
+            response = client.post(urljoin(base, "chat/completions"), json={"model": alias, **TOOL_SMOKE})
+            calls = (response.json().get("choices") or [{}])[0].get("message", {}).get("tool_calls") \
+                if response.is_success else None
+            success = response.is_success
+            detail = f"HTTP {response.status_code}" + (f", {len(calls)} tool call(s)" if calls else
+                                                         ", answered without a tool call" if success else
+                                                         f": {response.text[:160]}")
+        except (httpx.HTTPError, ValueError) as exc:
+            success, detail = False, str(exc)
+        print(f"{alias} tool calling ({item['tool_call_parser']}) elapsed={time.monotonic() - started:.2f}s "
+              f"{'OK' if success else 'FAILED'} {detail}")
+        failures += not success
+    return failures
 
 
 def main() -> None:

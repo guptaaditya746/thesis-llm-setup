@@ -19,9 +19,11 @@ models:
     # FP8 KV cache: ~69k tokens with the model dtype (2.1 full 32k requests,
     # measured 25 Sep 2026) roughly doubles. Set to auto to compare quality.
     kv_cache_dtype: fp8
+    tool_call_parser: hermes          # Qwen3 chat template uses Hermes-style tool calls
   lite:
     alias: lite-model
     model: ibm-granite/granite-4.1-8b
+    tool_call_parser: granite4        # the harness agent tool loop runs on Lite
     gpu: 1
     port: 8003
     max_num_active_seqs: 8

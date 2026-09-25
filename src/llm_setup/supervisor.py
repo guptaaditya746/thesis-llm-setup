@@ -62,6 +62,10 @@ def _command(role: str, item: dict[str, Any], session: Path) -> list[str]:
     kv_cache_dtype = item.get("kv_cache_dtype", "auto")
     if role != "embed" and kv_cache_dtype != "auto":
         command += ["--kv-cache-dtype", kv_cache_dtype]
+    # Tool calling (the harness agent loop sends tool_choice="auto") needs the
+    # model's parser; without it vLLM answers HTTP 400 for tool requests.
+    if role != "embed" and item.get("tool_call_parser"):
+        command += ["--enable-auto-tool-choice", "--tool-call-parser", item["tool_call_parser"]]
     return command
 
 
