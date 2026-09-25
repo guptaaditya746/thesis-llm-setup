@@ -19,6 +19,19 @@ import yaml
 from .models import model_targets
 from .process import process_matches
 
+# A timeout or a rate limit means the backend is already saturated; retrying
+# it from the gateway only adds load and hides the wait from the caller, who
+# owns its own deadline. Only transient server errors are retried, once.
+RETRY_POLICY = {
+    "TimeoutErrorRetries": 0,
+    "RateLimitErrorRetries": 0,
+    "BadRequestErrorRetries": 0,
+    "AuthenticationErrorRetries": 0,
+    "ContentPolicyViolationErrorRetries": 0,
+    "InternalServerErrorRetries": 1,
+    "ServiceUnavailableErrorRetries": 1,
+}
+
 
 def render_litellm(profile: dict[str, Any]) -> dict[str, Any]:
     models = []
@@ -34,8 +47,8 @@ def render_litellm(profile: dict[str, Any]) -> dict[str, Any]:
     return {"model_list": models,
             "general_settings": {"master_key": "os.environ/LITELLM_MASTER_KEY"},
             "litellm_settings": {"request_timeout": 120},
-            "router_settings": {"routing_strategy": "simple-shuffle", "num_retries": 2,
-                                "fallbacks": []}}
+            "router_settings": {"routing_strategy": "simple-shuffle", "num_retries": 1,
+                                "retry_policy": RETRY_POLICY, "fallbacks": []}}
 
 
 def _command(role: str, item: dict[str, Any], session: Path) -> list[str]:
@@ -46,6 +59,9 @@ def _command(role: str, item: dict[str, Any], session: Path) -> list[str]:
                "--max-num-seqs", str(item["max_num_active_seqs"])]
     if role == "embed":
         command += ["--runner", "pooling"]
+    kv_cache_dtype = item.get("kv_cache_dtype", "auto")
+    if role != "embed" and kv_cache_dtype != "auto":
+        command += ["--kv-cache-dtype", kv_cache_dtype]
     return command
 
 

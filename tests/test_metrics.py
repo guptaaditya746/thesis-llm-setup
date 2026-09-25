@@ -13,3 +13,9 @@ vllm:request_queue_time_seconds_bucket{le="+Inf"} 10
     assert parsed["running"] == 2 and parsed["waiting"] == 3
     assert parsed["kvCache"] == .82 and parsed["queueP95Seconds"] == 5
     assert "latencyP95Seconds" in parsed and parsed["latencyP95Seconds"] is None
+
+
+def test_preemptions_are_reported_when_present():
+    parsed = parse_metrics('vllm:num_preemptions_total{engine="0",model_name="heavy-model"} 7.0\n')
+    assert parsed["preemptions"] == 7
+    assert "preemptions" not in parse_metrics("vllm:num_requests_running 1\n")

@@ -74,3 +74,32 @@ def test_vllm_help_timeout_has_actionable_error(monkeypatch):
                             subprocess.TimeoutExpired("vllm serve --help", 600)))
     with pytest.raises(ProfileError, match="no services were started"):
         validate_vllm_options()
+
+
+def test_kv_cache_dtype_is_validated_and_embed_cannot_set_it():
+    data = profile()
+    assert data["models"]["heavy"]["kv_cache_dtype"] == "fp8"
+    data["models"]["heavy"]["kv_cache_dtype"] = "int4"
+    with pytest.raises(ProfileError, match="kv_cache_dtype"):
+        validate_profile(data)
+    data = profile()
+    data["models"]["embed"]["kv_cache_dtype"] = "fp8"
+    with pytest.raises(ProfileError, match="unsupported fields"):
+        validate_profile(data)
+
+
+def test_vllm_help_check_requires_kv_cache_flag_only_when_used(monkeypatch):
+    from types import SimpleNamespace
+
+    from llm_setup.profile import validate_vllm_options
+
+    flags = "--host --port --gpu-memory-utilization --max-model-len --max-num-seqs " \
+            "--served-model-name --runner {auto,draft,generate,pooling} --tensor-parallel-size"
+    monkeypatch.setattr("llm_setup.profile.shutil.which", lambda _name: "/env/bin/vllm")
+    monkeypatch.setattr("llm_setup.profile.subprocess.run",
+                        lambda *_a, **_k: SimpleNamespace(stdout=flags, stderr="", returncode=0))
+    data = profile()
+    with pytest.raises(ProfileError, match="--kv-cache-dtype"):
+        validate_vllm_options(data)
+    data["models"]["heavy"]["kv_cache_dtype"] = "auto"
+    validate_vllm_options(data)

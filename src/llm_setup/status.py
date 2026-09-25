@@ -68,7 +68,8 @@ class StatusMonitor:
                         "running": metrics.get("running"), "waiting": metrics.get("waiting"),
                         "kvCache": metrics.get("kvCache"),
                         "queueP95Seconds": metrics.get("queueP95Seconds"),
-                        "latencyP95Seconds": metrics.get("latencyP95Seconds")}
+                        "latencyP95Seconds": metrics.get("latencyP95Seconds"),
+                        "preemptions": metrics.get("preemptions")}
                 if reachable:
                     item["lastHealthyAt"] = _iso(now)
                 self.last[alias] = {k: v for k, v in item.items() if v is not None}
@@ -129,13 +130,16 @@ def create_app(profile: dict[str, Any], history: History) -> FastAPI:
             "# TYPE llm_queue_time_seconds_p95 gauge",
             "# HELP llm_request_latency_seconds_p95 Backend end-to-end latency p95",
             "# TYPE llm_request_latency_seconds_p95 gauge",
+            "# HELP llm_preemptions_total Requests paused because the KV cache was full",
+            "# TYPE llm_preemptions_total counter",
         ]
         for alias, item in monitor.last.items():
             lines.append(f'llm_backend_up{{alias="{alias}"}} {int(item["state"] not in {"unavailable", "unknown"})}')
             for key, metric in (("running", "llm_requests_running"), ("waiting", "llm_requests_waiting"),
                                 ("kvCache", "llm_kv_cache_usage_ratio"),
                                 ("queueP95Seconds", "llm_queue_time_seconds_p95"),
-                                ("latencyP95Seconds", "llm_request_latency_seconds_p95")):
+                                ("latencyP95Seconds", "llm_request_latency_seconds_p95"),
+                                ("preemptions", "llm_preemptions_total")):
                 if item.get(key) is not None:
                     lines.append(f'{metric}{{alias="{alias}"}} {item[key]}')
         return "\n".join(lines) + "\n"

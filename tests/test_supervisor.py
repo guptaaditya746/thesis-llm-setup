@@ -16,6 +16,9 @@ def test_litellm_config_has_aliases_without_cross_role_fallback(monkeypatch):
         "heavy-model", "lite-model", "qwen-embed"
     }
     assert config["router_settings"]["fallbacks"] == []
+    # A saturated backend is not retried by the gateway (that only adds load).
+    policy = config["router_settings"]["retry_policy"]
+    assert policy["TimeoutErrorRetries"] == 0 and policy["RateLimitErrorRetries"] == 0
     assert config["general_settings"]["master_key"] == "os.environ/LITELLM_MASTER_KEY"
     for role, deployment in zip(("heavy", "lite", "embed"), config["model_list"]):
         assert deployment["litellm_params"]["model"] == f"openai/{deployment['model_name']}"
@@ -66,3 +69,14 @@ def test_startup_failure_names_missing_cuda_compiler(tmp_path):
     log = tmp_path / "heavy.log"
     log.write_text("RuntimeError: Could not find nvcc and default cuda_home='/usr/local/cuda' doesn't exist")
     assert "VLLM_USE_FLASHINFER_SAMPLER=1" in _failure_hint(log)
+
+
+def test_kv_cache_dtype_is_passed_to_chat_backends_only(monkeypatch):
+    monkeypatch.setenv("EMBED_MODEL_ID", "org/embed")
+    data = load_profile("profiles/a100-3x40.yaml")
+    heavy = _command("heavy", data["models"]["heavy"], Path("runtime/test"))
+    assert heavy[heavy.index("--kv-cache-dtype") + 1] == "fp8"
+    lite = _command("lite", {**data["models"]["lite"], "kv_cache_dtype": "auto"}, Path("runtime/test"))
+    assert "--kv-cache-dtype" not in lite
+    embed = _command("embed", data["models"]["embed"], Path("runtime/test"))
+    assert "--kv-cache-dtype" not in embed

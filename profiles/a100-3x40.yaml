@@ -16,6 +16,9 @@ models:
     max_num_queued_reqs: 8
     max_model_len: 32768
     gpu_memory_utilization: 0.92
+    # FP8 KV cache: ~69k tokens with the model dtype (2.1 full 32k requests,
+    # measured 25 Sep 2026) roughly doubles. Set to auto to compare quality.
+    kv_cache_dtype: fp8
   lite:
     alias: lite-model
     model: ibm-granite/granite-4.1-8b

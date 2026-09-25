@@ -14,6 +14,9 @@ import yaml
 ALIASES = {"heavy": "heavy-model", "lite": "lite-model", "embed": "qwen-embed"}
 _ENV = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)\}")
 _DEFAULT_VLLM_HELP_TIMEOUT_SECONDS = 600
+# KV-cache storage types accepted by vLLM's --kv-cache-dtype. "auto" keeps the
+# model's own dtype; the FP8 variants roughly double the tokens that fit.
+KV_CACHE_DTYPES = {"auto", "fp8", "fp8_e4m3", "fp8_e5m2"}
 
 
 class ProfileError(ValueError):
@@ -31,7 +34,7 @@ def load_profile(path: str | Path, *, check_vllm: bool = False) -> dict[str, Any
         data["models"]["embed"]["model"] = os.environ["EMBED_MODEL_ID"]
     validate_profile(data)
     if check_vllm:
-        validate_vllm_options()
+        validate_vllm_options(data)
     return data
 
 
@@ -60,6 +63,8 @@ def validate_profile(data: Any) -> None:
                             "max_num_queued_reqs", "max_model_len", "gpu_memory_utilization"}
         if role == "embed":
             supported_fields.add("task")
+        else:
+            supported_fields.add("kv_cache_dtype")
         unknown = set(model) - supported_fields
         if unknown:
             raise ProfileError(f"unsupported fields for models.{role}: {', '.join(sorted(unknown))}")
@@ -81,6 +86,10 @@ def validate_profile(data: Any) -> None:
             raise ProfileError(f"models.{role}.gpu_memory_utilization must be numeric") from exc
         if not 0 < memory_fraction <= 1:
             raise ProfileError(f"models.{role}.gpu_memory_utilization must be in (0, 1]")
+        if model.get("kv_cache_dtype", "auto") not in KV_CACHE_DTYPES:
+            raise ProfileError(
+                f"models.{role}.kv_cache_dtype must be one of: {', '.join(sorted(KV_CACHE_DTYPES))}"
+            )
         used_gpus.add(model["gpu"])
         used_ports.add(model["port"])
     if not isinstance(data.get("gateway"), dict) or not isinstance(data.get("status"), dict):
@@ -101,7 +110,14 @@ def validate_profile(data: Any) -> None:
         raise ProfileError("models.embed.task must be embed")
 
 
-def validate_vllm_options() -> set[str]:
+def uses_kv_cache_dtype(profile: dict[str, Any] | None) -> bool:
+    """True when any role asks for a non-default KV-cache dtype."""
+    if not profile:
+        return False
+    return any(item.get("kv_cache_dtype", "auto") != "auto" for item in profile["models"].values())
+
+
+def validate_vllm_options(profile: dict[str, Any] | None = None) -> set[str]:
     """Read installed CLI help and fail early if required launch flags are absent."""
     executable = shutil.which("vllm")
     if not executable:
@@ -129,6 +145,8 @@ def validate_vllm_options() -> set[str]:
         raise ProfileError(f"could not inspect vllm serve --help: {help_text[-1000:]}")
     required = {"--host", "--port", "--gpu-memory-utilization", "--max-model-len", "--max-num-seqs",
                 "--served-model-name", "--runner", "--tensor-parallel-size"}
+    if uses_kv_cache_dtype(profile):
+        required.add("--kv-cache-dtype")
     available = {flag for flag in required if flag in help_text}
     missing = sorted(required - available)
     if missing:

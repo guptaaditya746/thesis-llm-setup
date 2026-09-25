@@ -38,6 +38,11 @@ def parse_metrics(text: str) -> dict[str, Any]:
             result[key] = int(number) if key in ("running", "waiting") else number
     result["queueP95Seconds"] = _histogram_quantile(values, "vllm:request_queue_time_seconds", 0.95)
     result["latencyP95Seconds"] = _histogram_quantile(values, "vllm:e2e_request_latency_seconds", 0.95)
+    preemptions = values.get("vllm:num_preemptions_total") or values.get("vllm:num_preemptions", [])
+    if preemptions:
+        # Cumulative: requests paused because the KV cache was full. A rising
+        # value under load means too many long requests run at once.
+        result["preemptions"] = int(sum(v for _, v in preemptions))
     successes = values.get("vllm:request_success", [])
     if successes:
         result["requestSuccess"] = sum(v for _, v in successes)
