@@ -74,7 +74,8 @@ def test_startup_failure_names_missing_cuda_compiler(tmp_path):
 def test_kv_cache_dtype_is_passed_to_chat_backends_only(monkeypatch):
     monkeypatch.setenv("EMBED_MODEL_ID", "org/embed")
     data = load_profile("profiles/a100-3x40.yaml")
-    heavy = _command("heavy", data["models"]["heavy"], Path("runtime/test"))
+    assert "--kv-cache-dtype" not in _command("heavy", data["models"]["heavy"], Path("runtime/test"))
+    heavy = _command("heavy", {**data["models"]["heavy"], "kv_cache_dtype": "fp8"}, Path("runtime/test"))
     assert heavy[heavy.index("--kv-cache-dtype") + 1] == "fp8"
     lite = _command("lite", {**data["models"]["lite"], "kv_cache_dtype": "auto"}, Path("runtime/test"))
     assert "--kv-cache-dtype" not in lite
@@ -95,3 +96,28 @@ def test_tool_call_parser_enables_auto_tool_choice(monkeypatch):
     plain = _command("lite", {k: v for k, v in data["models"]["lite"].items() if k != "tool_call_parser"},
                      Path("runtime/test"))
     assert "--enable-auto-tool-choice" not in plain
+
+
+def test_startup_failure_blames_fp8_kv_cache_when_flashinfer_attention_compiled(tmp_path):
+    log = tmp_path / "heavy.log"
+    log.write_text("Using FLASHINFER backend.\nRuntimeError: Could not find nvcc and default cuda_home")
+    assert "kv_cache_dtype: auto" in _failure_hint(log)
+    log.write_text("Qwen3-30B-A3B-Instruct-2507-FP8\nRuntimeError: Could not find nvcc")
+    assert "VLLM_USE_FLASHINFER_SAMPLER=1" in _failure_hint(log)
+
+
+def test_tool_call_smoke_needs_a_parsed_call():
+    import httpx
+
+    from llm_setup.cli import _tool_call_result
+
+    def reply(message):
+        return httpx.Response(200, json={"choices": [{"message": message}]})
+
+    ok, detail = _tool_call_result(reply({"tool_calls": [
+        {"function": {"name": "get_weather", "arguments": '{"city": "Berlin"}'}}]}))
+    assert ok and "Berlin" in detail
+    ok, detail = _tool_call_result(reply({"content": '<tool_call>{"name": "get_weather"}</tool_call>'}))
+    assert not ok and "no parsed tool call" in detail
+    assert not _tool_call_result(reply(None))[0]
+    assert not _tool_call_result(httpx.Response(400, text="auto tool choice requires"))[0]

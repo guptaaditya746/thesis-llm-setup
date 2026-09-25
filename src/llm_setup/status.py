@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import UTC, datetime
 from typing import Any
 
@@ -99,7 +100,10 @@ def create_app(profile: dict[str, Any], history: History) -> FastAPI:
     async def start_polling() -> None:
         async def loop() -> None:
             while True:
-                await monitor.poll_once()
+                try:
+                    await monitor.poll_once()
+                except Exception:
+                    logging.getLogger(__name__).exception("status poll failed")
                 await asyncio.sleep(5)
         app.state.poller = asyncio.create_task(loop())
 

@@ -78,7 +78,7 @@ def test_vllm_help_timeout_has_actionable_error(monkeypatch):
 
 def test_kv_cache_dtype_is_validated_and_embed_cannot_set_it():
     data = profile()
-    assert data["models"]["heavy"]["kv_cache_dtype"] == "fp8"
+    assert data["models"]["heavy"]["kv_cache_dtype"] == "auto"
     data["models"]["heavy"]["kv_cache_dtype"] = "int4"
     with pytest.raises(ProfileError, match="kv_cache_dtype"):
         validate_profile(data)
@@ -101,6 +101,7 @@ def test_vllm_help_check_requires_kv_cache_flag_only_when_used(monkeypatch):
     data = profile()
     for item in data["models"].values():
         item.pop("tool_call_parser", None)
+    data["models"]["heavy"]["kv_cache_dtype"] = "fp8"
     with pytest.raises(ProfileError, match="--kv-cache-dtype"):
         validate_vllm_options(data)
     data["models"]["heavy"]["kv_cache_dtype"] = "auto"
@@ -131,3 +132,24 @@ def test_tool_call_parser_is_validated_against_the_installed_vllm(monkeypatch):
     data["models"]["embed"]["tool_call_parser"] = "hermes"
     with pytest.raises(ProfileError, match="unsupported fields"):
         validate_profile(data)
+
+
+def test_fp8_kv_cache_is_refused_on_ampere_without_a_compiler(monkeypatch):
+    from types import SimpleNamespace
+
+    from llm_setup import profile as profile_module
+
+    data = profile()
+    data["models"]["heavy"]["kv_cache_dtype"] = "fp8"
+    monkeypatch.setattr(profile_module.shutil, "which",
+                        lambda name: "/usr/bin/nvidia-smi" if name == "nvidia-smi" else None)
+    monkeypatch.setattr(profile_module.subprocess, "run",
+                        lambda *_a, **_k: SimpleNamespace(stdout="8.0\n8.0\n8.0\n", returncode=0))
+    monkeypatch.setattr("importlib.util.find_spec", lambda name: None)
+    with pytest.raises(ProfileError, match="kv_cache_dtype: auto"):
+        profile_module.check_fp8_kv_cache(data)
+    monkeypatch.setattr(profile_module.subprocess, "run",
+                        lambda *_a, **_k: SimpleNamespace(stdout="9.0\n", returncode=0))
+    profile_module.check_fp8_kv_cache(data)
+    data["models"]["heavy"]["kv_cache_dtype"] = "auto"
+    profile_module.check_fp8_kv_cache(data)

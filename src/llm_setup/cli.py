@@ -127,6 +127,28 @@ TOOL_SMOKE = {
 }
 
 
+def _tool_call_result(response: httpx.Response) -> tuple[bool, str]:
+    """OK only when the reply carries a parsed get_weather call with JSON arguments.
+
+    A missing or wrong parser leaves ``<tool_call>`` text in the content instead,
+    which the harness agent loop cannot use.
+    """
+    if not response.is_success:
+        return False, f"HTTP {response.status_code}: {response.text[:160]}"
+    try:
+        message = ((response.json().get("choices") or [{}])[0].get("message")) or {}
+        calls = message.get("tool_calls") or []
+        function = calls[0].get("function") or {} if calls else {}
+        arguments = json.loads(function.get("arguments") or "null") if calls else None
+    except (ValueError, AttributeError, IndexError, TypeError) as exc:
+        return False, f"HTTP {response.status_code}, unreadable tool call: {exc}"
+    if function.get("name") == "get_weather" and isinstance(arguments, dict):
+        return True, f"HTTP {response.status_code}, tool call get_weather({json.dumps(arguments)})"
+    content = str(message.get("content") or "")[:120]
+    return False, (f"HTTP {response.status_code}, no parsed tool call (check tool_call_parser); "
+                   f"content: {content!r}")
+
+
 def _smoke_tool_calls(client: httpx.Client, base: str, profile: dict) -> int:
     """One tool-calling request per role that serves a tool-call parser (the agent loop needs it)."""
     failures = 0
@@ -137,13 +159,8 @@ def _smoke_tool_calls(client: httpx.Client, base: str, profile: dict) -> int:
         started = time.monotonic()
         try:
             response = client.post(urljoin(base, "chat/completions"), json={"model": alias, **TOOL_SMOKE})
-            calls = (response.json().get("choices") or [{}])[0].get("message", {}).get("tool_calls") \
-                if response.is_success else None
-            success = response.is_success
-            detail = f"HTTP {response.status_code}" + (f", {len(calls)} tool call(s)" if calls else
-                                                         ", answered without a tool call" if success else
-                                                         f": {response.text[:160]}")
-        except (httpx.HTTPError, ValueError) as exc:
+            success, detail = _tool_call_result(response)
+        except httpx.HTTPError as exc:
             success, detail = False, str(exc)
         print(f"{alias} tool calling ({item['tool_call_parser']}) elapsed={time.monotonic() - started:.2f}s "
               f"{'OK' if success else 'FAILED'} {detail}")

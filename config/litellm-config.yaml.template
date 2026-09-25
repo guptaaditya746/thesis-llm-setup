@@ -1,8 +1,3 @@
-# Generated at runtime from the selected profile. Stable aliases only.
+# Not used at runtime: supervisor.render_litellm generates the real config per
+# session from the selected profile (stable aliases, retry policy, no fallbacks).
 model_list: []
-litellm_settings:
-  num_retries: 2
-  request_timeout: 120
-  fallbacks: []
-router_settings:
-  fallbacks: []

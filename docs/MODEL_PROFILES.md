@@ -1,6 +1,6 @@
 # Model profiles
 
-Profiles define the three role aliases, exact model ID, GPU index, loopback port, active sequence limit, queued request limit, context window, GPU memory fraction and, for chat roles, the KV-cache dtype. GPU placement is one role per GPU. The A100 profile uses GPU 0 for Heavy at port 8002 (4 active, 8 queued), GPU 1 for Lite at 8003 (8 active, 16 queued), and GPU 2 for Embed at 8001 (32 active, 64 queued). LiteLLM enforces each role's finite in-flight cap as active plus queued and rejects excess requests with a rate-limit response; no request waits in an unbounded proxy queue.
+Profiles define the three role aliases, exact model ID, GPU index, loopback port, active sequence limit, queued request limit, context window, GPU memory fraction and, for chat roles, the KV-cache dtype. GPU placement is one role per GPU. The A100 profile uses GPU 0 for Heavy at port 8002 (4 active, 8 queued), GPU 1 for Lite at 8003 (8 active, 16 queued), and GPU 2 for Embed at 8001 (32 active, 64 queued). LiteLLM caps each role's in-flight requests at active plus queued (`max_parallel_requests`). Requests beyond the cap wait inside LiteLLM rather than being rejected, and that wait counts towards the 120 s gateway timeout.
 
 | Role | Alias | Model in `a100-3x40` | Context | Memory fraction | KV cache |
 | --- | --- | --- | --- | --- | --- |
@@ -17,7 +17,9 @@ The KV cache limits how many tokens can be in flight at once, which matters more
 | Heavy | 69,296 tokens | 2.11 |
 | Lite | 127,728 tokens | 3.90 |
 
-Heavy therefore uses `kv_cache_dtype: fp8`, which roughly doubles its capacity. Allowed values are `auto` (default, the model dtype), `fp8`, `fp8_e4m3` and `fp8_e5m2`; the embedding role does not accept the field. FP8 KV can shift outputs slightly: compare quality on the gold set, and set `auto` to go back. After a change, check the startup log again and watch `preemptions` in `/v1/status`: a rising count under load means too many long requests run at once.
+Heavy is the bottleneck, but it keeps the model dtype (`kv_cache_dtype: auto`). An FP8 KV cache would roughly double its capacity, yet on A100 (compute capability 8.0) vLLM serves FP8 KV with the FlashInfer attention backend, whose kernels are JIT-compiled with `nvcc` at startup unless `flashinfer-jit-cache` (matching the installed flashinfer version) is installed. The Slurm image has no CUDA toolkit, so Heavy would die before `/health` answers and the whole start would fail. `start` and `verify` now refuse `fp8` on pre-Hopper GPUs when neither `nvcc` nor `flashinfer-jit-cache` is available. FP8 KV also uses a KV scale of 1.0 without calibration, which can cost accuracy: compare on the gold set before keeping it.
+
+Allowed values are `auto` (default, the model dtype), `fp8`, `fp8_e4m3` and `fp8_e5m2`; the embedding role does not accept the field. Watch `preemptions` in `/v1/status`: a rising count under load means too many long requests run at once.
 
 ## Tool calling
 
@@ -36,4 +38,4 @@ Validation rejects unknown profile fields, zero or unbounded queue settings, and
 
 ## Gateway retries
 
-The generated LiteLLM config retries only transient server errors, once. Timeouts and rate limits are not retried by the gateway: both mean the backend is saturated, and a retry adds load while hiding the wait from the caller, which owns its own deadline.
+The generated LiteLLM config retries only transient server errors (5xx, 503), once. Timeouts are not retried by the gateway: a timed-out generation usually means the backend is saturated, a retry adds load, and the harness's own per-call timeouts (45-120 s) are at or below the gateway's 120 s, so a gateway retry would arrive after the caller has given up anyway.

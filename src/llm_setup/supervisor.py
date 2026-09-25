@@ -92,6 +92,14 @@ def _failure_hint(log_path: Path | None) -> str:
         tail = log_path.read_text(encoding="utf-8", errors="replace")[-16000:]
     except OSError:
         return ""
+    fp8_kv_markers = ("FLASHINFER backend", "FlashInfer attention", "kv_cache_dtype=fp8",
+                      "kv_cache_dtype='fp8'", "--kv-cache-dtype fp8")
+    if "Could not find nvcc" in tail and any(marker in tail for marker in fp8_kv_markers):
+        return (
+            "; FlashInfer attention kernels could not be compiled because nvcc is unavailable. "
+            "This happens with kv_cache_dtype fp8 on pre-Hopper GPUs: set kv_cache_dtype: auto "
+            "in the profile, or install flashinfer-jit-cache"
+        )
     if "Could not find nvcc" in tail:
         return (
             "; FlashInfer sampler JIT failed because nvcc is unavailable. "

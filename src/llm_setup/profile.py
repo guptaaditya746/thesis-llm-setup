@@ -37,6 +37,7 @@ def load_profile(path: str | Path, *, check_vllm: bool = False) -> dict[str, Any
     validate_profile(data)
     if check_vllm:
         validate_vllm_options(data)
+        check_fp8_kv_cache(data)
     return data
 
 
@@ -120,6 +121,50 @@ def uses_kv_cache_dtype(profile: dict[str, Any] | None) -> bool:
     if not profile:
         return False
     return any(item.get("kv_cache_dtype", "auto") != "auto" for item in profile["models"].values())
+
+
+def _gpu_compute_capabilities() -> list[float]:
+    """Compute capability of each visible GPU from nvidia-smi; [] when unavailable."""
+    executable = shutil.which("nvidia-smi")
+    if not executable:
+        return []
+    try:
+        result = subprocess.run([executable, "--query-gpu=compute_cap", "--format=csv,noheader"],
+                                capture_output=True, text=True, check=False, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    values = []
+    for line in result.stdout.splitlines():
+        try:
+            values.append(float(line.strip()))
+        except ValueError:
+            continue
+    return values
+
+
+def check_fp8_kv_cache(profile: dict[str, Any] | None) -> None:
+    """Refuse an FP8 KV cache that would make vLLM compile FlashInfer kernels at startup.
+
+    Before Hopper (compute capability 9.0), vLLM serves an FP8 KV cache with the
+    FlashInfer attention backend. Its kernels are JIT-compiled with nvcc unless
+    the ``flashinfer_jit_cache`` package is installed; Slurm images usually have
+    neither, and the backend then dies before /health answers.
+    """
+    if not uses_kv_cache_dtype(profile):
+        return
+    capabilities = _gpu_compute_capabilities()
+    if not capabilities or min(capabilities) >= 9.0:
+        return
+    import importlib.util
+
+    if importlib.util.find_spec("flashinfer_jit_cache") is not None or shutil.which("nvcc"):
+        return
+    raise ProfileError(
+        f"kv_cache_dtype fp8 on GPUs with compute capability {min(capabilities):g} needs the FlashInfer "
+        "attention backend, which JIT-compiles with nvcc; neither nvcc nor flashinfer-jit-cache is "
+        "available. Set kv_cache_dtype: auto, or install flashinfer-jit-cache matching the installed "
+        "flashinfer version. No services were started."
+    )
 
 
 def tool_call_parsers(profile: dict[str, Any] | None) -> set[str]:

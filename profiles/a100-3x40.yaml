@@ -16,9 +16,11 @@ models:
     max_num_queued_reqs: 8
     max_model_len: 32768
     gpu_memory_utilization: 0.92
-    # FP8 KV cache: ~69k tokens with the model dtype (2.1 full 32k requests,
-    # measured 25 Sep 2026) roughly doubles. Set to auto to compare quality.
-    kv_cache_dtype: fp8
+    # Model-dtype KV cache: 69,296 tokens (2.1 full 32k requests, measured
+    # 25 Sep 2026). fp8 would roughly double it, but on A100 it needs the
+    # FlashInfer attention backend, which JIT-compiles with nvcc (absent on
+    # the node) unless flashinfer-jit-cache is installed. See MODEL_PROFILES.md.
+    kv_cache_dtype: auto
     tool_call_parser: hermes          # Qwen3 chat template uses Hermes-style tool calls
   lite:
     alias: lite-model
