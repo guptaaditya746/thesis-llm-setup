@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -91,7 +93,20 @@ def _iso(timestamp: float | None = None) -> str:
     return value.isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
-def create_app(profile: dict[str, Any], history: History) -> FastAPI:
+def read_events(session: Path | None, count: int = 50) -> list[dict[str, Any]]:
+    """The supervisor's recent events (start, exit, restart, stop) from the session folder."""
+    if session is None or not (session / "events.jsonl").exists():
+        return []
+    rows = []
+    for line in (session / "events.jsonl").read_text(encoding="utf-8").splitlines()[-count:]:
+        try:
+            rows.append(json.loads(line))
+        except ValueError:
+            continue
+    return rows
+
+
+def create_app(profile: dict[str, Any], history: History, session: Path | None = None) -> FastAPI:
     monitor = StatusMonitor(profile, history)
     app = FastAPI()
     app.state.monitor = monitor
@@ -122,6 +137,10 @@ def create_app(profile: dict[str, Any], history: History) -> FastAPI:
         if not monitor.last:
             await monitor.poll_once()
         return monitor.document()
+
+    @app.get("/v1/events")
+    async def events() -> dict[str, Any]:
+        return {"events": read_events(session)}
 
     @app.get("/metrics", response_class=PlainTextResponse)
     async def prometheus() -> str:

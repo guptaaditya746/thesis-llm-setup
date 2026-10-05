@@ -17,7 +17,7 @@ from .history import History
 from .models import model_targets
 from .profile import ProfileError, load_profile, validate_vllm_options
 from .status import StatusMonitor
-from .supervisor import render_litellm, start, stop
+from .supervisor import clock, render_litellm, start, stop
 
 
 def _active_session() -> Path | None:
@@ -28,6 +28,15 @@ def _active_session() -> Path | None:
     if not session_id or any(char not in "0123456789T-Zabcdef-" for char in session_id):
         raise RuntimeError("runtime/current contains an invalid session identifier")
     return Path("runtime") / session_id
+
+
+def _latest_session() -> Path | None:
+    """The current session, or else the newest one (so events of a stopped session stay readable)."""
+    current = _active_session()
+    if current:
+        return current
+    folders = sorted(path for path in Path("runtime").glob("2*") if path.is_dir())
+    return folders[-1] if folders else None
 
 
 def _gateway_aliases(port: int, key: str) -> set[str]:
@@ -175,22 +184,60 @@ def main() -> None:
     validate_sub = validate.add_subparsers(dest="profile_command", required=True)
     profile_validate = validate_sub.add_parser("validate")
     profile_validate.add_argument("--profile", required=True)
-    for command in ("start", "verify", "smoke"):
+    for command in ("start", "verify", "smoke", "doctor"):
         cmd = sub.add_parser(command)
         cmd.add_argument("--profile", required=True)
+        if command == "start":
+            cmd.add_argument("--foreground", action="store_true",
+                             help="stay running: restart crashed services, stop everything on SIGTERM/Ctrl-C "
+                                  "(used by the Slurm batch job)")
+        if command == "doctor":
+            cmd.add_argument("--smoke", action="store_true", help="also send one request per model")
     sub.add_parser("status")
     sub.add_parser("stop")
     logs = sub.add_parser("logs")
     logs.add_argument("--service", required=True)
+    events = sub.add_parser("events", help="what the supervisor saw: starts, exits, restarts, stops")
+    events.add_argument("--count", type=int, default=30)
     args = parser.parse_args()
     try:
         if args.command == "profile":
             profile = load_profile(args.profile)
             print(f"Profile valid: {profile['name']}")
         elif args.command == "start":
+            started = time.monotonic()
+
+            def say(text: str) -> None:
+                print(f"[{clock(time.monotonic() - started)}] {text}", flush=True)
+
+            say("checking the profile and vLLM options")
             profile = load_profile(args.profile, check_vllm=True)
-            session = start(args.profile, profile, os.environ)
-            print(f"Started session {session}")
+            session = start(args.profile, profile, dict(os.environ), say=say)
+            if not args.foreground:
+                print(f"Started session {session.path}")
+                return
+            from .watchdog import Watchdog
+
+            watchdog = Watchdog(session, say, f"http://127.0.0.1:{profile['status']['port']}/v1/status")
+            watchdog.install_signals()
+            sys.exit(watchdog.run())
+        elif args.command == "doctor":
+            from .doctor import checks, report
+
+            code = report(checks(args.profile))
+            if args.smoke:
+                code = max(code, _smoke(args.profile))
+            sys.exit(code)
+        elif args.command == "events":
+            session = _latest_session()
+            if not session or not (session / "events.jsonl").exists():
+                raise RuntimeError("no events recorded yet")
+            lines = (session / "events.jsonl").read_text(encoding="utf-8").splitlines()[-args.count:]
+            print(f"session {session.name}")
+            for line in lines:
+                row = json.loads(line)
+                print(f"{row['time']}  {row['service']:<8} {row['event']}"
+                      + (f" ({row['detail']})" if row.get("detail") else ""))
         elif args.command == "verify":
             sys.exit(_verify(args.profile))
         elif args.command == "smoke":
@@ -230,6 +277,9 @@ def main() -> None:
                 print(f"{alias:<12} {pid!s:<6} {item['state']:<12} {item.get('running', '-'):>7} "
                       f"{item.get('waiting', '-'):>7} "
                       f"{item.get('kvCache', '-'):>8} {item['backend']}")
+    except KeyboardInterrupt:
+        print("interrupted; processes of a session that did not finish starting were stopped", file=sys.stderr)
+        sys.exit(130)
     except (ProfileError, OSError, RuntimeError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         sys.exit(1)

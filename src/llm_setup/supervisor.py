@@ -5,10 +5,13 @@ from __future__ import annotations
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import time
 import uuid
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -17,6 +20,7 @@ import httpx
 import yaml
 
 from .models import model_targets
+from .phases import current_phase, tail
 from .process import process_matches
 
 # A timeout or a rate limit means the backend is already saturated; retrying
@@ -109,101 +113,261 @@ def _failure_hint(log_path: Path | None) -> str:
     return ""
 
 
-def _wait_health(url: str, process: subprocess.Popen[Any], timeout: int = 1800,
-                 log_path: Path | None = None) -> None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if process.poll() is not None:
-            hint = _failure_hint(log_path)
-            raise RuntimeError(
-                f"process exited with status {process.returncode} before {url} became healthy{hint}"
-            )
+# How long a service may take to answer its health check after launch.
+STARTUP_TIMEOUT_S = {"embed": 1800, "heavy": 1800, "lite": 1800, "gateway": 180, "status": 60}
+CHAT_ROLES = ("embed", "heavy", "lite")
+Say = Callable[[str], None]
+
+
+def clock(seconds: float) -> str:
+    seconds = int(max(0, seconds))
+    return f"{seconds // 3600:d}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
+
+
+@dataclass
+class Service:
+    """One supervised process: how to launch it and how to tell it is ready."""
+
+    name: str
+    command: list[str]
+    env: dict[str, str]
+    log: Path
+    health: str
+    timeout: int
+    process: subprocess.Popen[Any] | None = None
+    started: float = 0.0
+    restarts: list[float] = field(default_factory=list)
+    state: str = "stopped"          # starting, ready, unhealthy, restarting, failed, stopped
+
+    def launch(self) -> None:
+        handle = self.log.open("ab")
+        self.process = subprocess.Popen(self.command, stdout=handle, stderr=subprocess.STDOUT, env=self.env,
+                                        start_new_session=True)
+        handle.close()
+        self.started = time.monotonic()
+        self.state = "starting"
+
+    def exited(self) -> int | None:
+        return None if self.process is None else self.process.poll()
+
+    def healthy(self) -> bool:
         try:
-            if httpx.get(url, timeout=2).is_success:
-                return
+            return httpx.get(self.health, timeout=2).is_success
         except httpx.HTTPError:
-            pass
-        time.sleep(2)
-    raise RuntimeError(f"timed out waiting for {url}")
+            return False
 
 
-def start(profile_path: str | Path, profile: dict[str, Any], env: dict[str, str]) -> Path:
+@dataclass
+class Session:
+    id: str
+    path: Path
+    services: dict[str, Service]
+
+    def save(self) -> None:
+        records = {name: {"pid": item.process.pid, "command": item.command, "log": str(item.log)}
+                   for name, item in self.services.items() if item.process is not None}
+        _save_records(self.path, self.id, records)
+
+
+def build_services(profile: dict[str, Any], env: dict[str, str], session: Path, session_id: str,
+                   key: str) -> dict[str, Service]:
+    base = {**os.environ, **env}
+    services: dict[str, Service] = {}
+    for role in CHAT_ROLES:
+        item = profile["models"][role]
+        services[role] = Service(role, _command(role, item, session), _vllm_environment(base, item, session_id),
+                                 session / f"{role}.log", f"http://127.0.0.1:{item['port']}/health",
+                                 STARTUP_TIMEOUT_S[role])
+    gateway_env = {k: v for k, v in base.items() if k != "HF_TOKEN"}
+    gateway_env.update({"LLM_SETUP_SESSION_ID": session_id, "LLM_BACKEND_KEY": key, "LITELLM_MASTER_KEY": key})
+    services["gateway"] = Service(
+        "gateway", ["litellm", "--config", str(session / "litellm-config.yaml"), "--host", "127.0.0.1",
+                    "--port", str(profile["gateway"]["port"])], gateway_env, session / "gateway.log",
+        f"http://127.0.0.1:{profile['gateway']['port']}/health/liveliness", STARTUP_TIMEOUT_S["gateway"])
+    status_env = {k: v for k, v in base.items()
+                  if k not in {"HF_TOKEN", "LITELLM_MASTER_KEY", "LLM_BACKEND_KEY", "VLLM_API_KEY"}}
+    status_env["LLM_SETUP_SESSION_ID"] = session_id
+    services["status"] = Service(
+        "status", [sys.executable, "-m", "llm_setup.status_server", str(session / "profile.yaml"),
+                   "--database", str(session / "status.sqlite3"), "--session", str(session)],
+        status_env, session / "status.log", f"http://127.0.0.1:{profile['status']['port']}/healthz",
+        STARTUP_TIMEOUT_S["status"])
+    return services
+
+
+def wait_ready(services: list[Service], say: Say, interval: float = 15.0, poll: float = 2.0) -> None:
+    """Wait until every service answers its health check, printing what each is doing.
+
+    A line per ``interval`` names each service's phase (read from its log); a service that exits or
+    exceeds its timeout raises with the end of its log and a hint.
+    """
+    waiting = list(services)
+    last_report = time.monotonic()
+    while waiting:
+        for service in list(waiting):
+            code = service.exited()
+            if code is not None:
+                raise RuntimeError(f"{service.name} exited with status {code} before it became healthy"
+                                   f"{_failure_hint(service.log)}\n--- last lines of {service.log} ---\n"
+                                   f"{tail(service.log)}")
+            if service.healthy():
+                service.state = "ready"
+                waiting.remove(service)
+                say(f"{service.name}: ready after {clock(time.monotonic() - service.started)}")
+            elif time.monotonic() - service.started > service.timeout:
+                raise RuntimeError(f"{service.name} not healthy after {clock(service.timeout)} "
+                                   f"({current_phase(service.log)})\n--- last lines of {service.log} ---\n"
+                                   f"{tail(service.log)}")
+        if waiting and time.monotonic() - last_report >= interval:
+            last_report = time.monotonic()
+            say(" · ".join(f"{item.name}: {current_phase(item.log)} ({clock(time.monotonic() - item.started)})"
+                           for item in waiting))
+        if waiting:
+            time.sleep(poll)
+
+
+def port_in_use(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.settimeout(0.5)
+        return probe.connect_ex(("127.0.0.1", port)) == 0
+
+
+def recorded_alive(session_dir: Path, session_id: str) -> list[str]:
+    """Services of a recorded session whose process is still running (and carries its marker)."""
+    state_file = session_dir / "processes.json"
+    if not state_file.exists():
+        return []
+    try:
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    return [name for name, data in state.get("services", {}).items()
+            if process_matches(int(data["pid"]), session_id)]
+
+
+def clear_stale(root: Path, say: Say) -> None:
+    """Forget a recorded session none of whose processes is alive (an allocation that ended, a
+    terminal that closed). A session with live processes still blocks a new start."""
+    current = root / "current"
+    if not current.exists():
+        return
+    session_id = current.read_text(encoding="utf-8").strip()
+    if not _valid_session_id(session_id):
+        raise RuntimeError("runtime/current holds an invalid session id; remove it after checking runtime/")
+    alive = recorded_alive(root / session_id, session_id)
+    if alive:
+        raise RuntimeError(f"session {session_id} is still running ({', '.join(alive)}); "
+                           "run `llm-setup stop` first, or `scancel` its Slurm job")
+    current.unlink()
+    record_event(root / session_id, "session", "cleared", "no recorded process was alive at the next start")
+    say(f"previous session {session_id} ended without `stop` (no process alive); cleared")
+
+
+def record_event(session: Path, service: str, event: str, detail: str = "") -> dict[str, str]:
+    row = {"time": datetime.now(UTC).isoformat(timespec="seconds"), "service": service, "event": event,
+           "detail": detail}
+    try:
+        with (session / "events.jsonl").open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row) + "\n")
+    except OSError:
+        pass
+    return row
+
+
+def start(profile_path: str | Path, profile: dict[str, Any], env: dict[str, str], say: Say = print) -> Session:
+    """Launch the three models in parallel, then the gateway and the status API, with progress."""
     key = env.get("LITELLM_MASTER_KEY", "")
     if not key or key == "replace-with-a-local-secret":
         raise RuntimeError("set a non-placeholder LITELLM_MASTER_KEY before start")
     root = Path("runtime")
     root.mkdir(exist_ok=True)
-    if (root / "current").exists():
-        active = (root / "current").read_text(encoding="utf-8").strip()
-        raise RuntimeError(f"session {active} is recorded as current; run stop or verify before starting another")
+    clear_stale(root, say)
+    ports = {role: item["port"] for role, item in profile["models"].items()}
+    ports.update(gateway=profile["gateway"]["port"], status=profile["status"]["port"])
+    busy = [f"{name} :{port}" for name, port in ports.items() if port_in_use(port)]
+    if busy:
+        raise RuntimeError(f"ports already in use: {', '.join(busy)}; another server (or a session that was "
+                           "not stopped) holds them. `llm-setup doctor` shows more")
     session_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
-    session = root / session_id
-    session.mkdir()
-    (session / "profile.yaml").write_text(yaml.safe_dump(profile, sort_keys=False), encoding="utf-8")
-    litellm = render_litellm(profile)
-    litellm_path = session / "litellm-config.yaml"
-    litellm_path.write_text(yaml.safe_dump(litellm, sort_keys=False), encoding="utf-8")
-    records: dict[str, Any] = {}
-    (session / "metadata.json").write_text(json.dumps({"sessionId": session_id,
-        "profile": str(profile_path), "services": list(profile["models"]), "environmentVariables": [
+    path = root / session_id
+    path.mkdir()
+    (path / "profile.yaml").write_text(yaml.safe_dump(profile, sort_keys=False), encoding="utf-8")
+    (path / "litellm-config.yaml").write_text(yaml.safe_dump(render_litellm(profile), sort_keys=False),
+                                              encoding="utf-8")
+    (path / "metadata.json").write_text(json.dumps({"sessionId": session_id,
+        "profile": str(profile_path), "services": list(profile["models"]), "host": socket.gethostname(),
+        "slurmJobId": os.environ.get("SLURM_JOB_ID"), "environmentVariables": [
             "HF_TOKEN", "LITELLM_MASTER_KEY", "LLM_BACKEND_KEY", "LLM_SETUP_SESSION_ID"]}, indent=2),
         encoding="utf-8")
+    session = Session(session_id, path, build_services(profile, env, path, session_id, key))
+    say(f"session {session_id} on {socket.gethostname()}; logs in {path}")
+    record_event(path, "session", "starting", socket.gethostname())
     try:
-        for role in ("embed", "heavy", "lite"):
-            item = profile["models"][role]
-            command = _command(role, item, session)
-            child_env = _vllm_environment({**os.environ, **env}, item, session_id)
-            log_path = session / f"{role}.log"
-            log = log_path.open("ab")
-            process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, env=child_env,
-                                       start_new_session=True)
-            records[role] = {"pid": process.pid, "command": command, "log": str(session / f"{role}.log")}
-            _save_records(session, session_id, records)
-            _wait_health(f"http://127.0.0.1:{item['port']}/health", process, log_path=log_path)
-        litellm_command = ["litellm", "--config", str(litellm_path), "--host", "127.0.0.1",
-                           "--port", str(profile["gateway"]["port"])]
-        gateway_env = os.environ.copy()
-        gateway_env.pop("HF_TOKEN", None)
-        gateway_env["LLM_SETUP_SESSION_ID"] = session_id
-        gateway_env["LLM_BACKEND_KEY"] = key
-        gateway_env["LITELLM_MASTER_KEY"] = key
-        child = subprocess.Popen(litellm_command, stdout=(session / "gateway.log").open("ab"),
-                                 stderr=subprocess.STDOUT, env=gateway_env, start_new_session=True)
-        records["gateway"] = {"pid": child.pid, "command": litellm_command, "log": str(session / "gateway.log")}
-        _save_records(session, session_id, records)
-        _wait_health(f"http://127.0.0.1:{profile['gateway']['port']}/health/liveliness", child, 120)
-        status_command = [sys.executable, "-m", "llm_setup.status_server", str(session / "profile.yaml"),
-                          "--database", str(session / "status.sqlite3"), "--session", str(session)]
-        status_env = os.environ.copy()
-        status_env.pop("HF_TOKEN", None)
-        status_env.pop("LITELLM_MASTER_KEY", None)
-        status_env.pop("LLM_BACKEND_KEY", None)
-        status_env.pop("VLLM_API_KEY", None)
-        status_env["LLM_SETUP_SESSION_ID"] = session_id
-        status = subprocess.Popen(status_command, stdout=(session / "status.log").open("ab"),
-                                  stderr=subprocess.STDOUT, env=status_env, start_new_session=True)
-        records["status"] = {"pid": status.pid, "command": status_command, "log": str(session / "status.log")}
-        _save_records(session, session_id, records)
-        _wait_health(f"http://127.0.0.1:{profile['status']['port']}/healthz", status, 60)
+        models = [session.services[role] for role in CHAT_ROLES]
+        for service in models:
+            service.launch()
+        session.save()
+        say("models: " + ", ".join(f"{role} on GPU {profile['models'][role]['gpu']}" for role in CHAT_ROLES)
+            + " (loading in parallel; usually 5-20 min)")
+        wait_ready(models, say)
+        for name in ("gateway", "status"):
+            session.services[name].launch()
+            session.save()
+            wait_ready([session.services[name]], say)
         (root / "current").write_text(session_id, encoding="utf-8")
+        record_event(path, "session", "ready")
+        say(f"ready: gateway http://127.0.0.1:{profile['gateway']['port']}/v1 · "
+            f"status http://127.0.0.1:{profile['status']['port']}/v1/status")
         return session
-    except Exception as exc:
-        _terminate_records(session_id, records, root)
-        raise RuntimeError(f"startup failed in session {session_id}: {exc}; logs: {session}") from exc
+    except BaseException as exc:
+        terminate(session, say=lambda _: None)
+        record_event(path, "session", "start failed", str(exc).splitlines()[0][:300])
+        if isinstance(exc, KeyboardInterrupt):
+            raise
+        raise RuntimeError(f"startup failed in session {session_id}: {exc}\nlogs: {path}") from exc
+
+
+def terminate(session: Session, say: Say = print, grace_s: float = 30.0) -> list[str]:
+    """Stop the session's own processes: SIGTERM, then SIGKILL after ``grace_s``."""
+    stopped = []
+    for service in reversed(list(session.services.values())):
+        process = service.process
+        if process is not None and process.poll() is None and process_matches(process.pid, session.id):
+            signal_owned(process.pid, signal.SIGTERM)
+            stopped.append(service.name)
+    deadline = time.monotonic() + grace_s
+    for service in session.services.values():
+        process = service.process
+        if process is None:
+            continue
+        try:
+            process.wait(timeout=max(0.1, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            if process_matches(process.pid, session.id):
+                say(f"{service.name} did not stop in {int(grace_s)} s; killing it")
+                signal_owned(process.pid, signal.SIGKILL)
+        service.state = "stopped"
+    return stopped
+
+
+def signal_owned(pid: int, number: int) -> None:
+    """Signal a session process and, when it leads its own process group (start_new_session), the
+    whole group: vLLM starts engine workers that must stop with it."""
+    try:
+        if os.getpgid(pid) == pid:
+            os.killpg(pid, number)
+        else:
+            os.kill(pid, number)
+    except ProcessLookupError:
+        pass
+
+
+def _valid_session_id(session_id: str) -> bool:
+    return bool(session_id) and all(char in "0123456789T-Zabcdef-" for char in session_id)
 
 
 def _save_records(session: Path, session_id: str, records: dict[str, Any]) -> None:
     (session / "processes.json").write_text(json.dumps({"sessionId": session_id, "services": records}, indent=2))
-
-
-def _terminate_records(session_id: str, records: dict[str, Any], root: Path) -> None:
-    for data in reversed(list(records.values())):
-        pid = data["pid"]
-        if process_matches(pid, session_id, root):
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
 
 
 def stop() -> list[str]:
@@ -212,18 +376,20 @@ def stop() -> list[str]:
     if not current.exists():
         return []
     session_id = current.read_text(encoding="utf-8").strip()
-    if not session_id or any(char not in "0123456789T-Zabcdef-" for char in session_id):
+    if not _valid_session_id(session_id):
         return ["invalid runtime/current session identifier; no processes were signalled"]
     session = root / session_id
     state_file = session / "processes.json"
     if not state_file.exists():
         return [f"missing process state for {session_id}"]
     state = json.loads(state_file.read_text(encoding="utf-8"))
+    # Unlink first: a foreground supervisor sees the session end and does not restart what stops.
+    current.unlink()
+    record_event(session, "session", "stop requested", "llm-setup stop")
     stopped = []
     for service, data in reversed(list(state["services"].items())):
         pid = int(data["pid"])
         if process_matches(pid, session_id, root):
-            os.kill(pid, signal.SIGTERM)
+            signal_owned(pid, signal.SIGTERM)
             stopped.append(service)
-    current.unlink()
     return stopped

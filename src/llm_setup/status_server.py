@@ -1,6 +1,7 @@
 """Internal entry point for the supervised status API."""
 
 import argparse
+from pathlib import Path
 
 import uvicorn
 
@@ -16,7 +17,7 @@ def main() -> None:
     parser.add_argument("--session", required=True)
     args = parser.parse_args()
     profile = load_profile(args.profile)
-    app = create_app(profile, History(args.database))
+    app = create_app(profile, History(args.database), Path(args.session))
     uvicorn.run(app, host=profile["status"]["host"], port=profile["status"]["port"], log_level="warning")
 
 

@@ -16,19 +16,26 @@ flowchart LR
 
 Heavy (`heavy-model`) handles quality schema inference, evidence review, and answer verification. Lite (`lite-model`) handles structured and EDC extraction, mapping, planning, and MCP control. Embed (`qwen-embed`) accepts embedding requests only.
 
-## Quick start in a Slurm allocation
+## Quick start: a Slurm batch job
+
+The stack runs as a batch job, so it keeps running when your terminal or SSH connection closes, restarts a
+service that crashes, and stops cleanly at `scancel` or three minutes before the time limit.
 
 ```sh
-srun --gres=gpu:ampere:3 --cpus-per-task=16 --mem=64g --time=48:00:00 --pty bash -l
 cd /mnt/ceph/storage/data-tmp/current/xepi3167/thesis/final-final-llm-setup
-cp .env.example .env
-# Set LITELLM_MASTER_KEY and configure Hugging Face credentials if needed.
-set -a; source .env; set +a
-mkdir -p "$LLM_SETUP_LOCAL_ROOT"
-uv python install 3.13
-uv sync --python 3.13 --extra serve
-uv run llm-setup profile validate --profile profiles/a100-3x40.yaml
-uv run llm-setup start --profile profiles/a100-3x40.yaml
+cp .env.example .env                       # once: set LITELLM_MASTER_KEY (and Hugging Face credentials)
+sbatch slurm/llm-stack.sbatch              # prints the job id
+tail -f runtime/slurm-<jobid>.out          # what it is doing: per-model phase every 15 s, then events
 ```
+
+The log shows each model's phase while it loads (downloading, loading weights 63%, capturing CUDA graphs,
+ready after 4:12), then a line for every exit, restart and stop, and a summary every five minutes. For a shell
+on the same node (doctor, the harness, tunnels): `srun --jobid <jobid> --overlap --pty bash -l`, then
+`set -a; source .env; set +a` and `uv run llm-setup doctor --profile profiles/a100-3x40.yaml`.
+Stop with `scancel <jobid>`.
+
+Interactively (inside `srun --pty`), the same: `uv run llm-setup start --profile profiles/a100-3x40.yaml
+--foreground`; without `--foreground` the command returns once everything is ready and nothing watches
+the services afterwards.
 
 The example environment puts the Python environment and package cache on node-local scratch to avoid slow imports from shared Ceph storage. The venv is temporary and must be recreated in a new allocation. The initial embedding ID is set in `profiles/a100-3x40.yaml` and can be overridden with `EMBED_MODEL_ID`. No model weights are downloaded by validation. See `docs/OPERATIONS.md` for exact lifecycle commands.

@@ -1,7 +1,17 @@
 # Debugging
 
+Start with `uv run llm-setup doctor --profile profiles/a100-3x40.yaml` on the compute node (inside the job:
+`srun --jobid <jobid> --overlap --pty bash -l`). It checks the allocation, key, profile, GPUs (leftover
+processes), weights in the cache, ports, the session, each health endpoint, the gateway key and aliases and
+the status API, and names the first problem. `llm-setup events` shows what the supervisor saw.
+
 | Symptom | Evidence | Recovery |
 |---|---|---|
+| `start` printed nothing for minutes (older versions) | each model loads for 5-20 min | Current `start` prints each model's phase every 15 s; `tail -f runtime/slurm-<jobid>.out` for the batch job. |
+| `session … is recorded as current` | the previous allocation ended without `stop` | Current `start` clears a session with no live process itself; with live processes, `llm-setup stop` or `scancel` its job. |
+| Everything gone after closing the terminal | the stack ran inside `srun --pty` | Run it as the batch job (`sbatch slurm/llm-stack.sbatch`). |
+| `ports already in use` at start | another server or an unstopped session holds a port | `llm-setup doctor`, then `ss -ltnp \| grep :<port>`; stop only processes you own. |
+| LiteLLM unavailable during a run | `llm-setup events` shows `gateway exited`, then `restarted` | The batch job restarts it within seconds; `gave up restarting` means it keeps crashing: read `llm-setup logs --service gateway`. |
 | LiteLLM healthy, vLLM unavailable | `llm-setup status`, then `llm-setup logs --service heavy` (or `lite`/`embed`) | Check allocation, model ID, and backend log; restart the owned session after correcting the profile. |
 | High waiting queue | Status `waiting`, queue p95, and LiteLLM log | Reduce caller concurrency and follow `INCIDENTS.md`; do not raise limits without a benchmark. |
 | High KV cache | `kvCache` near 0.92 | Shorten context or lower concurrency, then validate the profile. |
