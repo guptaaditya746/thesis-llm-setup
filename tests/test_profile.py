@@ -17,6 +17,15 @@ def test_profile_loads_and_substitutes_embedding_model():
     assert data["models"]["embed"]["model"] == "org/qwen-embedder"
 
 
+def test_revision_must_be_a_nonempty_string():
+    data = profile()
+    data["models"]["heavy"]["revision"] = "abc123"
+    validate_profile(data)
+    data["models"]["heavy"]["revision"] = "  "
+    with pytest.raises(ProfileError, match="revision"):
+        validate_profile(data)
+
+
 def test_duplicate_gpu_or_port_is_rejected():
     data = profile()
     data["models"]["lite"]["gpu"] = 0

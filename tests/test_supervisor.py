@@ -74,6 +74,7 @@ def test_vllm_environment_disables_flashinfer_sampler_without_toolkit():
     assert env["VLLM_USE_FLASHINFER_SAMPLER"] == "0"
     assert env["CUDA_VISIBLE_DEVICES"] == "2"
     assert env["HF_TOKEN"] == "hf-secret"
+    assert env["HF_HUB_OFFLINE"] == "1"
     assert "LITELLM_MASTER_KEY" not in env
 
 
@@ -108,6 +109,13 @@ def test_tool_call_parser_enables_auto_tool_choice(monkeypatch):
     assert lite[lite.index("--tool-call-parser") + 1] == "granite4"
     heavy = _command("heavy", data["models"]["heavy"], Path("runtime/test"))
     assert heavy[heavy.index("--tool-call-parser") + 1] == "hermes"
+
+
+def test_model_revision_is_passed_to_vllm(monkeypatch):
+    monkeypatch.setenv("EMBED_MODEL_ID", "org/embed")
+    data = load_profile("profiles/a100-3x40.yaml")
+    command = _command("heavy", {**data["models"]["heavy"], "revision": "abc123"}, Path("runtime/test"))
+    assert command[command.index("--revision") + 1] == "abc123"
     embed = _command("embed", data["models"]["embed"], Path("runtime/test"))
     assert "--tool-call-parser" not in embed
     plain = _command("lite", {k: v for k, v in data["models"]["lite"].items() if k != "tool_call_parser"},

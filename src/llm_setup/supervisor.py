@@ -70,6 +70,8 @@ def _command(role: str, item: dict[str, Any], session: Path) -> list[str]:
     # model's parser; without it vLLM answers HTTP 400 for tool requests.
     if item.get("task") != "embed" and item.get("tool_call_parser"):
         command += ["--enable-auto-tool-choice", "--tool-call-parser", item["tool_call_parser"]]
+    if item.get("revision"):
+        command += ["--revision", item["revision"]]
     command.extend(item.get("extra_args", []))
     return command
 
@@ -80,6 +82,7 @@ def _vllm_environment(base: dict[str, str], item: dict[str, Any], session_id: st
     child_env.pop("LLM_BACKEND_KEY", None)
     child_env.pop("VLLM_API_KEY", None)
     child_env["HF_TOKEN"] = base.get("HF_TOKEN", "")
+    child_env["HF_HUB_OFFLINE"] = "1"
     child_env["LLM_SETUP_SESSION_ID"] = session_id
     child_env["CUDA_VISIBLE_DEVICES"] = str(item["gpu"])
     # FlashInfer's sampler JIT-compiles on first request and requires nvcc. Many

@@ -70,7 +70,7 @@ def validate_profile(data: Any) -> None:
             raise ProfileError(f"models.{role} must be a mapping")
         supported_fields = {"alias", "model", "gpu", "port", "max_num_active_seqs",
                             "max_num_queued_reqs", "max_model_len", "gpu_memory_utilization",
-                            "replicas", "extra_args"}
+                            "replicas", "extra_args", "revision"}
         is_embed = model.get("task") == "embed"
         if is_embed:
             supported_fields.add("task")
@@ -88,6 +88,9 @@ def validate_profile(data: Any) -> None:
         aliases.add(model["alias"])
         if not model.get("model"):
             raise ProfileError(f"models.{role}.model is required; set EMBED_MODEL_ID if needed")
+        revision = model.get("revision")
+        if revision is not None and (not isinstance(revision, str) or not revision.strip()):
+            raise ProfileError(f"models.{role}.revision must be a non-empty commit or tag")
         for key in ("gpu", "port", "max_num_active_seqs", "max_num_queued_reqs", "max_model_len"):
             minimum = 0 if key == "gpu" else 1
             if type(model.get(key)) is not int or model[key] < minimum:
