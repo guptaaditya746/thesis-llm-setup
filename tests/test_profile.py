@@ -44,6 +44,35 @@ def test_profile_yaml_is_valid():
     yaml.safe_load(Path("profiles/a100-3x40.yaml").read_text(encoding="utf-8"))
 
 
+def test_agent_profile_allows_custom_roles_replicas_and_extra_args(monkeypatch):
+    monkeypatch.delenv("EMBED_MODEL_ID", raising=False)
+    data = load_profile("profiles/agent-3x40.yaml")
+    assert set(data["models"]) == {"orch", "sub"}
+    assert data["models"]["sub"]["replicas"] == [{"gpu": 2, "port": 8004}]
+    data["models"]["sub"]["replicas"][0]["gpu"] = 1
+    with pytest.raises(ProfileError, match="GPU"):
+        validate_profile(data)
+
+
+def test_extra_args_flags_are_checked_against_vllm_help(monkeypatch):
+    from types import SimpleNamespace
+
+    from llm_setup.profile import validate_vllm_options
+
+    monkeypatch.setattr("llm_setup.profile.shutil.which", lambda _name: "/env/bin/vllm")
+    flags = ("--host --port --gpu-memory-utilization --max-model-len --max-num-seqs "
+             "--served-model-name --runner {auto,draft,generate,pooling} --tensor-parallel-size "
+             "--reasoning-parser --generation-config --enable-prefix-caching --enable-auto-tool-choice "
+             "--tool-call-parser {hermes}")
+    monkeypatch.setattr("llm_setup.profile.subprocess.run", lambda *_a, **_k:
+                        SimpleNamespace(stdout=flags, stderr="", returncode=0))
+    validate_vllm_options(load_profile("profiles/agent-3x40.yaml"))
+    monkeypatch.setattr("llm_setup.profile.subprocess.run", lambda *_a, **_k:
+                        SimpleNamespace(stdout=flags.replace("--generation-config", ""), stderr="", returncode=0))
+    with pytest.raises(ProfileError, match="--generation-config"):
+        validate_vllm_options(load_profile("profiles/agent-3x40.yaml"))
+
+
 def test_vllm_help_check_allows_slow_shared_filesystem_startup(monkeypatch):
     from types import SimpleNamespace
 

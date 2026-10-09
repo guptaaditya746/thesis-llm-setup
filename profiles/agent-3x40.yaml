@@ -1,0 +1,41 @@
+name: agent-3x40
+bind_host: 127.0.0.1
+gateway:
+  host: 127.0.0.1
+  port: 4000
+status:
+  host: 127.0.0.1
+  port: 8010
+models:
+  orch:
+    alias: orch-model
+    model: Qwen/Qwen3.8-27B-FP8
+    gpu: 0
+    port: 8001
+    max_num_active_seqs: 8
+    max_num_queued_reqs: 8
+    max_model_len: 65536
+    gpu_memory_utilization: 0.92
+    kv_cache_dtype: auto
+    extra_args:
+      - --reasoning-parser
+      - qwen3
+      - --generation-config
+      - vllm
+      - --enable-prefix-caching
+  sub:
+    alias: sub-model
+    model: Qwen/Qwen3-30B-A3B-Instruct-2507-FP8
+    gpu: 1
+    port: 8002
+    replicas:
+      - gpu: 2
+        port: 8004
+    max_num_active_seqs: 3
+    max_num_queued_reqs: 8
+    max_model_len: 32768
+    gpu_memory_utilization: 0.92
+    kv_cache_dtype: auto
+    tool_call_parser: hermes
+storage:
+  database: runtime/status.sqlite3

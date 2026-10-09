@@ -19,7 +19,7 @@ from typing import Any
 import httpx
 import yaml
 
-from .models import model_targets
+from .models import model_instances
 from .phases import current_phase, tail
 from .process import process_matches
 
@@ -39,19 +39,19 @@ RETRY_POLICY = {
 
 def render_litellm(profile: dict[str, Any]) -> dict[str, Any]:
     models = []
-    for alias, target in model_targets(profile).items():
-        task = "embedding" if target["role"] == "embed" else "chat"
-        limits = profile["models"][target["role"]]
+    for target in model_instances(profile):
+        alias = target["alias"]
+        task = "embedding" if target.get("task") == "embed" else "chat"
         models.append({"model_name": alias, "litellm_params": {
             "model": f"openai/{alias}",
-            "api_base": target["backend"] + "/v1", "api_key": "os.environ/LLM_BACKEND_KEY",
+            "api_base": f"http://127.0.0.1:{target['port']}/v1", "api_key": "os.environ/LLM_BACKEND_KEY",
             "drop_params": True,
-            "max_parallel_requests": limits["max_num_active_seqs"] + limits["max_num_queued_reqs"],
+            "max_parallel_requests": target["max_num_active_seqs"] + target["max_num_queued_reqs"],
         }, "model_info": {"mode": task}})
     return {"model_list": models,
             "general_settings": {"master_key": "os.environ/LITELLM_MASTER_KEY"},
             "litellm_settings": {"request_timeout": 120},
-            "router_settings": {"routing_strategy": "simple-shuffle", "num_retries": 1,
+            "router_settings": {"routing_strategy": "least-busy", "num_retries": 1,
                                 "retry_policy": RETRY_POLICY, "fallbacks": []}}
 
 
@@ -61,15 +61,16 @@ def _command(role: str, item: dict[str, Any], session: Path) -> list[str]:
                "--gpu-memory-utilization", str(item["gpu_memory_utilization"]),
                "--max-model-len", str(item["max_model_len"]),
                "--max-num-seqs", str(item["max_num_active_seqs"])]
-    if role == "embed":
+    if item.get("task") == "embed":
         command += ["--runner", "pooling"]
     kv_cache_dtype = item.get("kv_cache_dtype", "auto")
-    if role != "embed" and kv_cache_dtype != "auto":
+    if item.get("task") != "embed" and kv_cache_dtype != "auto":
         command += ["--kv-cache-dtype", kv_cache_dtype]
     # Tool calling (the harness agent loop sends tool_choice="auto") needs the
     # model's parser; without it vLLM answers HTTP 400 for tool requests.
-    if role != "embed" and item.get("tool_call_parser"):
+    if item.get("task") != "embed" and item.get("tool_call_parser"):
         command += ["--enable-auto-tool-choice", "--tool-call-parser", item["tool_call_parser"]]
+    command.extend(item.get("extra_args", []))
     return command
 
 
@@ -115,7 +116,6 @@ def _failure_hint(log_path: Path | None) -> str:
 
 # How long a service may take to answer its health check after launch.
 STARTUP_TIMEOUT_S = {"embed": 1800, "heavy": 1800, "lite": 1800, "gateway": 180, "status": 60}
-CHAT_ROLES = ("embed", "heavy", "lite")
 Say = Callable[[str], None]
 
 
@@ -173,11 +173,11 @@ def build_services(profile: dict[str, Any], env: dict[str, str], session: Path, 
                    key: str) -> dict[str, Service]:
     base = {**os.environ, **env}
     services: dict[str, Service] = {}
-    for role in CHAT_ROLES:
-        item = profile["models"][role]
-        services[role] = Service(role, _command(role, item, session), _vllm_environment(base, item, session_id),
-                                 session / f"{role}.log", f"http://127.0.0.1:{item['port']}/health",
-                                 STARTUP_TIMEOUT_S[role])
+    for item in model_instances(profile):
+        name, role = item["name"], item["role"]
+        services[name] = Service(name, _command(role, item, session), _vllm_environment(base, item, session_id),
+                                 session / f"{name}.log", f"http://127.0.0.1:{item['port']}/health",
+                                 max(STARTUP_TIMEOUT_S.get(role, 1800), 1800))
     gateway_env = {k: v for k, v in base.items() if k != "HF_TOKEN"}
     gateway_env.update({"LLM_SETUP_SESSION_ID": session_id, "LLM_BACKEND_KEY": key, "LITELLM_MASTER_KEY": key})
     services["gateway"] = Service(
@@ -282,7 +282,7 @@ def start(profile_path: str | Path, profile: dict[str, Any], env: dict[str, str]
     root = Path("runtime")
     root.mkdir(exist_ok=True)
     clear_stale(root, say)
-    ports = {role: item["port"] for role, item in profile["models"].items()}
+    ports = {item["name"]: item["port"] for item in model_instances(profile)}
     ports.update(gateway=profile["gateway"]["port"], status=profile["status"]["port"])
     busy = [f"{name} :{port}" for name, port in ports.items() if port_in_use(port)]
     if busy:
@@ -303,11 +303,11 @@ def start(profile_path: str | Path, profile: dict[str, Any], env: dict[str, str]
     say(f"session {session_id} on {socket.gethostname()}; logs in {path}")
     record_event(path, "session", "starting", socket.gethostname())
     try:
-        models = [session.services[role] for role in CHAT_ROLES]
+        models = [service for name, service in session.services.items() if name not in {"gateway", "status"}]
         for service in models:
             service.launch()
         session.save()
-        say("models: " + ", ".join(f"{role} on GPU {profile['models'][role]['gpu']}" for role in CHAT_ROLES)
+        say("models: " + ", ".join(f"{item['name']} on GPU {item['gpu']}" for item in model_instances(profile))
             + " (loading in parallel; usually 5-20 min)")
         wait_ready(models, say)
         for name in ("gateway", "status"):

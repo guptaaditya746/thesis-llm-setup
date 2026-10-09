@@ -32,7 +32,7 @@ def load_profile(path: str | Path, *, check_vllm: bool = False) -> dict[str, Any
         return os.environ.get(match.group(1), "")
 
     data = yaml.safe_load(_ENV.sub(substitute, raw))
-    if os.environ.get("EMBED_MODEL_ID"):
+    if os.environ.get("EMBED_MODEL_ID") and "embed" in data["models"]:
         data["models"]["embed"]["model"] = os.environ["EMBED_MODEL_ID"]
     validate_profile(data)
     if check_vllm:
@@ -42,8 +42,8 @@ def load_profile(path: str | Path, *, check_vllm: bool = False) -> dict[str, Any
 
 
 def validate_profile(data: Any) -> None:
-    if not isinstance(data, dict) or set(data.get("models") or {}) != set(ALIASES):
-        raise ProfileError("profile.models must define exactly heavy, lite, and embed")
+    if not isinstance(data, dict) or not isinstance(data.get("models"), dict) or not data["models"]:
+        raise ProfileError("profile.models must define at least one role")
     allowed = {"name", "bind_host", "gateway", "status", "models", "storage"}
     unknown = set(data) - allowed
     if unknown:
@@ -58,31 +58,64 @@ def validate_profile(data: Any) -> None:
         raise ProfileError("bind_host must be 127.0.0.1 so vLLM stays loopback-only")
     used_ports: set[int] = set()
     used_gpus: set[int] = set()
-    for role, expected_alias in ALIASES.items():
-        model = data["models"][role]
+    aliases: set[str] = set()
+    service_names: set[str] = set()
+    for role, model in data["models"].items():
+        if not isinstance(role, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", role):
+            raise ProfileError(f"invalid model role name: {role!r}")
+        if role in {"gateway", "status"}:
+            raise ProfileError(f"models.{role} conflicts with a reserved service name")
+        expected_alias = ALIASES.get(role)
         if not isinstance(model, dict):
             raise ProfileError(f"models.{role} must be a mapping")
         supported_fields = {"alias", "model", "gpu", "port", "max_num_active_seqs",
-                            "max_num_queued_reqs", "max_model_len", "gpu_memory_utilization"}
-        if role == "embed":
+                            "max_num_queued_reqs", "max_model_len", "gpu_memory_utilization",
+                            "replicas", "extra_args"}
+        is_embed = model.get("task") == "embed"
+        if is_embed:
             supported_fields.add("task")
         else:
             supported_fields.update({"kv_cache_dtype", "tool_call_parser"})
         unknown = set(model) - supported_fields
         if unknown:
             raise ProfileError(f"unsupported fields for models.{role}: {', '.join(sorted(unknown))}")
-        if model.get("alias") != expected_alias:
+        if not isinstance(model.get("alias"), str) or not model["alias"]:
+            raise ProfileError(f"models.{role}.alias is required")
+        if expected_alias and model.get("alias") != expected_alias:
             raise ProfileError(f"models.{role}.alias must be {expected_alias}")
+        if model["alias"] in aliases:
+            raise ProfileError(f"model alias {model['alias']} is used by more than one role")
+        aliases.add(model["alias"])
         if not model.get("model"):
             raise ProfileError(f"models.{role}.model is required; set EMBED_MODEL_ID if needed")
         for key in ("gpu", "port", "max_num_active_seqs", "max_num_queued_reqs", "max_model_len"):
             minimum = 0 if key == "gpu" else 1
             if type(model.get(key)) is not int or model[key] < minimum:
                 raise ProfileError(f"models.{role}.{key} must be a positive integer")
-        if model["gpu"] in used_gpus:
-            raise ProfileError(f"GPU {model['gpu']} is assigned to more than one role")
-        if model["port"] in used_ports:
-            raise ProfileError(f"port {model['port']} is assigned to more than one role")
+        replicas = model.get("replicas", [])
+        if not isinstance(replicas, list):
+            raise ProfileError(f"models.{role}.replicas must be a list")
+        instances = [{"gpu": model["gpu"], "port": model["port"]}, *replicas]
+        for index, replica in enumerate(instances, start=1):
+            if not isinstance(replica, dict) or set(replica) != {"gpu", "port"}:
+                raise ProfileError(f"models.{role}.replicas entries must define gpu and port")
+            for key in ("gpu", "port"):
+                minimum = 0 if key == "gpu" else 1
+                if type(replica.get(key)) is not int or replica[key] < minimum:
+                    raise ProfileError(f"models.{role}.replicas.{key} must be a positive integer")
+            if replica["gpu"] in used_gpus:
+                raise ProfileError(f"GPU {replica['gpu']} is assigned more than once")
+            if replica["port"] in used_ports:
+                raise ProfileError(f"port {replica['port']} is assigned more than once")
+            service_name = role if index == 1 else f"{role}-{index}"
+            if service_name in service_names or service_name in {"gateway", "status"}:
+                raise ProfileError(f"duplicate or reserved service name: {service_name}")
+            service_names.add(service_name)
+            used_gpus.add(replica["gpu"])
+            used_ports.add(replica["port"])
+        extra_args = model.get("extra_args", [])
+        if not isinstance(extra_args, list) or any(not isinstance(arg, str) or not arg for arg in extra_args):
+            raise ProfileError(f"models.{role}.extra_args must be a list of vLLM arguments")
         try:
             memory_fraction = float(model.get("gpu_memory_utilization", 0))
         except (TypeError, ValueError) as exc:
@@ -96,8 +129,6 @@ def validate_profile(data: Any) -> None:
         parser = model.get("tool_call_parser")
         if parser is not None and (not isinstance(parser, str) or not _PARSER_NAME.fullmatch(parser)):
             raise ProfileError(f"models.{role}.tool_call_parser must be a vLLM parser name such as hermes")
-        used_gpus.add(model["gpu"])
-        used_ports.add(model["port"])
     if not isinstance(data.get("gateway"), dict) or not isinstance(data.get("status"), dict):
         raise ProfileError("gateway and status endpoint configuration is required")
     for name in ("gateway", "status"):
@@ -112,7 +143,9 @@ def validate_profile(data: Any) -> None:
         raise ProfileError("service ports must be between 1 and 65535")
     if len(set(ports)) != len(ports):
         raise ProfileError("service ports must be unique")
-    if data["models"]["embed"].get("task") != "embed":
+    if any(model.get("task") not in (None, "embed") for model in data["models"].values()):
+        raise ProfileError("model task, when set, must be embed")
+    if "embed" in data["models"] and data["models"]["embed"].get("task") != "embed":
         raise ProfileError("models.embed.task must be embed")
 
 
@@ -202,6 +235,9 @@ def validate_vllm_options(profile: dict[str, Any] | None = None) -> set[str]:
         raise ProfileError(f"could not inspect vllm serve --help: {help_text[-1000:]}")
     required = {"--host", "--port", "--gpu-memory-utilization", "--max-model-len", "--max-num-seqs",
                 "--served-model-name", "--runner", "--tensor-parallel-size"}
+    extra_flags = {arg.split("=", 1)[0] for item in (profile or {}).get("models", {}).values()
+                   for arg in item.get("extra_args", []) if arg.startswith("--")}
+    required.update(extra_flags)
     if uses_kv_cache_dtype(profile):
         required.add("--kv-cache-dtype")
     parsers = tool_call_parsers(profile)

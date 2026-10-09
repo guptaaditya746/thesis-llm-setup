@@ -17,6 +17,7 @@ from typing import Any
 
 import httpx
 
+from .models import model_instances
 from .profile import load_profile
 from .supervisor import port_in_use, recorded_alive
 
@@ -95,8 +96,8 @@ def checks(profile_path: str, *, run: Callable[[list[str]], str | None] = _run,
             parts = [part.strip() for part in line.split(",")]
             if len(parts) == 3 and parts[0].isdigit():
                 found[int(parts[0])] = (int(parts[1]), int(parts[2]))
-        for role, item in profile["models"].items():
-            gpu = item["gpu"]
+        for item in model_instances(profile):
+            role, gpu = item["name"], item["gpu"]
             if gpu not in found:
                 rows.append(("FAIL", f"GPU {gpu} ({role})", f"not visible; the allocation shows {sorted(found)}"))
             elif not running and found[gpu][0] > 2048:
@@ -112,7 +113,7 @@ def checks(profile_path: str, *, run: Callable[[list[str]], str | None] = _run,
         else:
             rows.append(("WARN", f"weights {role}", f"{item['model']} is not in {cache}; start will download it"))
 
-    ports = {role: item["port"] for role, item in profile["models"].items()}
+    ports = {item["name"]: item["port"] for item in model_instances(profile)}
     ports.update(gateway=profile["gateway"]["port"], status=profile["status"]["port"])
     if not running:
         for name, port in ports.items():
@@ -121,7 +122,8 @@ def checks(profile_path: str, *, run: Callable[[list[str]], str | None] = _run,
                                                                f"holds it (`ss -ltnp | grep :{port}`)")))
         return rows
 
-    for role, item in profile["models"].items():
+    for item in model_instances(profile):
+        role = item["name"]
         response = get(f"http://127.0.0.1:{item['port']}/health")
         rows.append(("PASS", f"{role} health", "ok") if response is not None and response.is_success else
                     ("FAIL", f"{role} health", "no answer; `llm-setup logs --service " + role + "`"))

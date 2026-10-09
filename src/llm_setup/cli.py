@@ -14,7 +14,7 @@ import httpx
 import yaml
 
 from .history import History
-from .models import model_targets
+from .models import model_instances, model_targets
 from .profile import ProfileError, load_profile, validate_vllm_options
 from .status import StatusMonitor
 from .supervisor import clock, render_litellm, start, stop
@@ -55,11 +55,12 @@ def _verify(profile_path: str) -> int:
     except ProfileError as exc:
         vllm = str(exc)
     generated = yaml.safe_load(yaml.safe_dump(render_litellm(profile)))
-    alias_targets = {item["model_name"]: item["litellm_params"]["api_base"]
+    alias_targets = {(item["model_name"], item["litellm_params"]["api_base"])
                      for item in generated["model_list"]}
-    expected_targets = {alias: target["backend"] + "/v1" for alias, target in model_targets(profile).items()}
+    expected_targets = {(item["alias"], f"http://127.0.0.1:{item['port']}/v1")
+                        for item in model_instances(profile)}
     config_ok = alias_targets == expected_targets and not generated["router_settings"]["fallbacks"]
-    aliases = set(alias_targets)
+    aliases = {alias for alias, _ in alias_targets}
     print(f"Profile: valid ({profile['name']})")
     print(f"LiteLLM configuration: {'valid' if config_ok else 'invalid'}; aliases: "
           f"{', '.join(sorted(aliases))}; cross-role fallbacks: none")
@@ -74,10 +75,11 @@ def _verify(profile_path: str) -> int:
     else:
         print("Process state: no active session")
     all_ok = vllm == "available" and config_ok
-    for alias, target in model_targets(profile).items():
+    for target in model_instances(profile):
+        alias = target["alias"]
         for endpoint in ("/health", "/metrics"):
             try:
-                response = httpx.get(target["backend"] + endpoint, timeout=2)
+                response = httpx.get(f"http://127.0.0.1:{target['port']}" + endpoint, timeout=2)
                 print(f"{alias} {endpoint}: HTTP {response.status_code}")
                 all_ok = all_ok and response.is_success
             except httpx.HTTPError:
@@ -103,20 +105,18 @@ def _smoke(profile_path: str) -> int:
     base = f"http://127.0.0.1:{profile['gateway']['port']}/v1/"
     failures = 0
     with httpx.Client(timeout=60, headers={"Authorization": f"Bearer {key}"}) as client:
-        for alias, request in (
-            ("heavy-model", {"messages": [{"role": "user", "content": "Reply OK."}], "max_tokens": 8}),
-            ("lite-model", {"messages": [{"role": "user", "content": "Reply OK."}], "max_tokens": 8}),
-            ("qwen-embed", {"input": ["smoke test"]}),
-        ):
+        for alias, target in model_targets(profile).items():
+            request = ({"input": ["smoke test"]} if target.get("task") == "embed" else
+                       {"messages": [{"role": "user", "content": "Reply OK."}], "max_tokens": 8})
             started = time.monotonic()
             try:
-                endpoint = "embeddings" if alias == "qwen-embed" else "chat/completions"
+                endpoint = "embeddings" if target.get("task") == "embed" else "chat/completions"
                 response = client.post(urljoin(base, endpoint), json={"model": alias, **request})
                 success = response.is_success
-                backend = model_targets(profile)[alias]["backend"]
+                backend = target["backend"]
                 detail = f"HTTP {response.status_code}"
             except httpx.HTTPError as exc:
-                success, backend, detail = False, model_targets(profile)[alias]["backend"], str(exc)
+                success, backend, detail = False, target["backend"], str(exc)
             elapsed = time.monotonic() - started
             print(f"{alias} backend={backend} elapsed={elapsed:.2f}s {'OK' if success else 'FAILED'} {detail}")
             failures += not success
@@ -161,8 +161,8 @@ def _tool_call_result(response: httpx.Response) -> tuple[bool, str]:
 def _smoke_tool_calls(client: httpx.Client, base: str, profile: dict) -> int:
     """One tool-calling request per role that serves a tool-call parser (the agent loop needs it)."""
     failures = 0
-    for role, item in profile["models"].items():
-        if role == "embed" or not item.get("tool_call_parser"):
+    for item in profile["models"].values():
+        if item.get("task") == "embed" or not item.get("tool_call_parser"):
             continue
         alias = item["alias"]
         started = time.monotonic()
@@ -245,11 +245,13 @@ def main() -> None:
         elif args.command == "stop":
             print("Stopped: " + (", ".join(stop()) or "no active owned processes"))
         elif args.command == "logs":
-            if args.service not in {"heavy", "lite", "embed", "gateway", "status"}:
-                raise RuntimeError("service must be one of heavy, lite, embed, gateway, status")
             session = _active_session()
             if not session:
                 raise RuntimeError("no active session")
+            state_path = session / "processes.json"
+            state = json.loads(state_path.read_text()) if state_path.exists() else {"services": {}}
+            if args.service not in state.get("services", {}):
+                raise RuntimeError(f"unknown service {args.service!r}; check the active session's services")
             log = session / f"{args.service}.log"
             if not log.exists():
                 raise RuntimeError(f"no log for service {args.service}")
@@ -265,10 +267,16 @@ def main() -> None:
             state_path = session / "processes.json"
             state = json.loads(state_path.read_text()) if state_path.exists() else {"services": {}}
             services = state.get("services", {})
-            print("ALIAS        PID    STATE        RUNNING WAITING KV CACHE BACKEND")
+            instances = model_instances(profile)
+            alias_counts = {item["alias"]: sum(other["alias"] == item["alias"] for other in instances)
+                            for item in instances}
+            service_by_status_key = {
+                (item["alias"] if alias_counts[item["alias"]] == 1
+                 else f"{item['alias']}@{item['port']}"): item["name"] for item in instances
+            }
+            print("ALIAS             PID    STATE        RUNNING WAITING KV CACHE BACKEND")
             for alias, item in report["models"].items():
-                role = {"heavy-model": "heavy", "lite-model": "lite", "qwen-embed": "embed"}[alias]
-                entry = services.get(role, {})
+                entry = services.get(service_by_status_key[alias], {})
                 pid = entry.get("pid", "-")
                 if isinstance(pid, int):
                     from .process import process_matches

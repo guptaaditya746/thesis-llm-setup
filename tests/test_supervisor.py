@@ -16,6 +16,7 @@ def test_litellm_config_has_aliases_without_cross_role_fallback(monkeypatch):
         "heavy-model", "lite-model", "qwen-embed"
     }
     assert config["router_settings"]["fallbacks"] == []
+    assert config["router_settings"]["routing_strategy"] == "least-busy"
     # A saturated backend is not retried by the gateway (that only adds load).
     policy = config["router_settings"]["retry_policy"]
     assert policy["TimeoutErrorRetries"] == 0 and policy["RateLimitErrorRetries"] == 0
@@ -26,6 +27,22 @@ def test_litellm_config_has_aliases_without_cross_role_fallback(monkeypatch):
         assert deployment["litellm_params"]["max_parallel_requests"] == (
             limits["max_num_active_seqs"] + limits["max_num_queued_reqs"]
         )
+
+
+def test_replicas_render_as_separate_deployments_and_custom_flags_launch(monkeypatch):
+    monkeypatch.delenv("EMBED_MODEL_ID", raising=False)
+    data = load_profile("profiles/agent-3x40.yaml")
+    deployments = render_litellm(data)["model_list"]
+    assert [(item["model_name"], item["litellm_params"]["api_base"]) for item in deployments] == [
+        ("orch-model", "http://127.0.0.1:8001/v1"),
+        ("sub-model", "http://127.0.0.1:8002/v1"),
+        ("sub-model", "http://127.0.0.1:8004/v1"),
+    ]
+    orch = _command("orch", data["models"]["orch"], Path("runtime/test"))
+    assert orch[-5:] == ["--reasoning-parser", "qwen3", "--generation-config", "vllm",
+                         "--enable-prefix-caching"]
+    sub = _command("sub", data["models"]["sub"], Path("runtime/test"))
+    assert sub[sub.index("--tool-call-parser") + 1] == "hermes"
 
 
 def test_pid_ownership_requires_exact_session_marker():

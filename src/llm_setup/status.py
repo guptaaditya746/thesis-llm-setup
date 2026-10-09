@@ -15,7 +15,7 @@ from fastapi.responses import PlainTextResponse
 
 from .history import History
 from .metrics import parse_metrics
-from .models import model_targets
+from .models import model_instances
 
 STATES = {"healthy", "busy", "saturated", "unavailable", "recovering", "unknown"}
 
@@ -42,7 +42,14 @@ def classify(previous: str, reachable: bool, metrics: dict[str, Any],
 
 class StatusMonitor:
     def __init__(self, profile: dict[str, Any], history: History):
-        self.targets = model_targets(profile)
+        instances = model_instances(profile)
+        alias_counts = {item["alias"]: sum(other["alias"] == item["alias"] for other in instances)
+                        for item in instances}
+        self.targets = {
+            (item["alias"] if alias_counts[item["alias"]] == 1 else f"{item['alias']}@{item['port']}"):
+                {**item, "backend": f"http://127.0.0.1:{item['port']}"}
+            for item in instances
+        }
         self.history = history
         self.last: dict[str, dict[str, Any]] = {}
         self.last_bad_at: dict[str, float] = {}

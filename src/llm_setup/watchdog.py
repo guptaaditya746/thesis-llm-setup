@@ -123,7 +123,7 @@ class Watchdog:
                        f"process alive for {int(UNHEALTHY_AFTER * self.check_s)} s without an answer")
 
     def _schedule_restart(self, service: Service) -> None:
-        model = service.name in {"heavy", "lite", "embed"}
+        model = service.name not in {"gateway", "status"}
         limit = MODEL_RESTARTS_PER_HOUR if model else SERVICE_RESTARTS_PER_HOUR
         recent = [moment for moment in service.restarts if time.time() - moment < 3600]
         if len(recent) >= limit:
