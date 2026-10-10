@@ -17,6 +17,7 @@ def test_litellm_config_has_aliases_without_cross_role_fallback(monkeypatch):
     }
     assert config["router_settings"]["fallbacks"] == []
     assert config["router_settings"]["routing_strategy"] == "least-busy"
+    assert config["litellm_settings"]["request_timeout"] == 600
     # A saturated backend is not retried by the gateway (that only adds load).
     policy = config["router_settings"]["retry_policy"]
     assert policy["TimeoutErrorRetries"] == 0 and policy["RateLimitErrorRetries"] == 0
@@ -29,6 +30,12 @@ def test_litellm_config_has_aliases_without_cross_role_fallback(monkeypatch):
         )
 
 
+def test_litellm_routing_strategy_can_be_overridden_for_measurement(monkeypatch):
+    monkeypatch.setenv("LITELLM_ROUTING_STRATEGY", "simple-shuffle")
+    data = load_profile("profiles/agent-3x40.yaml")
+    assert render_litellm(data)["router_settings"]["routing_strategy"] == "simple-shuffle"
+
+
 def test_replicas_render_as_separate_deployments_and_custom_flags_launch(monkeypatch):
     monkeypatch.delenv("EMBED_MODEL_ID", raising=False)
     data = load_profile("profiles/agent-3x40.yaml")
@@ -36,8 +43,13 @@ def test_replicas_render_as_separate_deployments_and_custom_flags_launch(monkeyp
     assert [(item["model_name"], item["litellm_params"]["api_base"]) for item in deployments] == [
         ("orch-model", "http://127.0.0.1:8001/v1"),
         ("sub-model", "http://127.0.0.1:8002/v1"),
+        ("sub-model-1", "http://127.0.0.1:8002/v1"),
         ("sub-model", "http://127.0.0.1:8004/v1"),
+        ("sub-model-2", "http://127.0.0.1:8004/v1"),
     ]
+    # LiteLLM exposes pinned aliases while still sending the backend's served name.
+    assert deployments[2]["litellm_params"]["model"] == "openai/sub-model"
+    assert deployments[4]["litellm_params"]["model"] == "openai/sub-model"
     orch = _command("orch", data["models"]["orch"], Path("runtime/test"))
     assert orch[-5:] == ["--reasoning-parser", "qwen3", "--generation-config", "vllm",
                          "--enable-prefix-caching"]

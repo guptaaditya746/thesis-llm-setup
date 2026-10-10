@@ -39,19 +39,27 @@ RETRY_POLICY = {
 
 def render_litellm(profile: dict[str, Any]) -> dict[str, Any]:
     models = []
+    instance_numbers: dict[str, int] = {}
     for target in model_instances(profile):
         alias = target["alias"]
+        role = target["role"]
+        instance_numbers[role] = instance_numbers.get(role, 0) + 1
         task = "embedding" if target.get("task") == "embed" else "chat"
-        models.append({"model_name": alias, "litellm_params": {
+        deployment = {"model_name": alias, "litellm_params": {
             "model": f"openai/{alias}",
             "api_base": f"http://127.0.0.1:{target['port']}/v1", "api_key": "os.environ/LLM_BACKEND_KEY",
             "drop_params": True,
             "max_parallel_requests": target["max_num_active_seqs"] + target["max_num_queued_reqs"],
-        }, "model_info": {"mode": task}})
+        }, "model_info": {"mode": task}}
+        models.append(deployment)
+        if profile["models"][role].get("replicas"):
+            pinned = {**deployment, "model_name": f"{alias}-{instance_numbers[role]}"}
+            models.append(pinned)
+    routing_strategy = os.environ.get("LITELLM_ROUTING_STRATEGY", "least-busy")
     return {"model_list": models,
             "general_settings": {"master_key": "os.environ/LITELLM_MASTER_KEY"},
-            "litellm_settings": {"request_timeout": 120},
-            "router_settings": {"routing_strategy": "least-busy", "num_retries": 1,
+            "litellm_settings": {"request_timeout": 600},
+            "router_settings": {"routing_strategy": routing_strategy, "num_retries": 1,
                                 "retry_policy": RETRY_POLICY, "fallbacks": []}}
 
 
