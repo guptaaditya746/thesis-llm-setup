@@ -21,6 +21,14 @@ set -euo pipefail
 cd "${SLURM_SUBMIT_DIR:-$PWD}"
 stamp() { echo "[$(date +%H:%M:%S)] $*"; }
 
+# vLLM normally asks the kernel for an ephemeral rendezvous port, closes the
+# probing socket, then binds that port in torch.distributed. Another process
+# can claim it in that gap, making model startup fail with EADDRINUSE. Give
+# each Slurm job a stable, non-ephemeral 16-port block instead. vLLM scans
+# forward from VLLM_PORT if a port in the block is already occupied.
+export VLLM_PORT="$((12000 + (SLURM_JOB_ID % 1250) * 16))"
+stamp "vLLM distributed port block starts at $VLLM_PORT (job ${SLURM_JOB_ID:-?})"
+
 if [ ! -f .env ]; then
   stamp "no .env in $PWD: copy .env.example to .env and set LITELLM_MASTER_KEY"; exit 1
 fi
