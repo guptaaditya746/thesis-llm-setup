@@ -158,3 +158,21 @@ def test_tool_call_smoke_needs_a_parsed_call():
     assert not ok and "no parsed tool call" in detail
     assert not _tool_call_result(reply(None))[0]
     assert not _tool_call_result(httpx.Response(400, text="auto tool choice requires"))[0]
+
+
+def test_orch_3x40_balances_one_alias_over_three_gpus(monkeypatch):
+    from llm_setup.models import model_instances
+
+    monkeypatch.delenv("EMBED_MODEL_ID", raising=False)
+    data = load_profile("profiles/orch-3x40.yaml")
+    deployments = render_litellm(data)["model_list"]
+    assert [(item["model_name"], item["litellm_params"]["api_base"]) for item in deployments] == [
+        ("orch-model", "http://127.0.0.1:8001/v1"),
+        ("orch-model-1", "http://127.0.0.1:8001/v1"),
+        ("orch-model", "http://127.0.0.1:8002/v1"),
+        ("orch-model-2", "http://127.0.0.1:8002/v1"),
+        ("orch-model", "http://127.0.0.1:8003/v1"),
+        ("orch-model-3", "http://127.0.0.1:8003/v1"),
+    ]
+    assert {item["litellm_params"]["model"] for item in deployments} == {"openai/orch-model"}
+    assert [(i["name"], i["gpu"]) for i in model_instances(data)] == [("orch", 0), ("orch-2", 1), ("orch-3", 2)]

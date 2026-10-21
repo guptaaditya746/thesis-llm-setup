@@ -191,3 +191,14 @@ def test_fp8_kv_cache_is_refused_on_ampere_without_a_compiler(monkeypatch):
     profile_module.check_fp8_kv_cache(data)
     data["models"]["heavy"]["kv_cache_dtype"] = "auto"
     profile_module.check_fp8_kv_cache(data)
+
+
+def test_orch_only_profiles_serve_only_the_pinned_orch_model(monkeypatch):
+    monkeypatch.delenv("EMBED_MODEL_ID", raising=False)
+    agent = load_profile("profiles/agent-3x40.yaml")["models"]["orch"]
+    one = load_profile("profiles/orch-1x40.yaml")
+    three = load_profile("profiles/orch-3x40.yaml")
+    assert set(one["models"]) == set(three["models"]) == {"orch"}
+    assert one["models"]["orch"] == agent           # the same settings as the agent profile's orch
+    assert {k: v for k, v in three["models"]["orch"].items() if k != "replicas"} == agent
+    assert three["models"]["orch"]["replicas"] == [{"gpu": 1, "port": 8002}, {"gpu": 2, "port": 8003}]

@@ -39,3 +39,24 @@ Validation rejects unknown profile fields, zero or unbounded queue settings, and
 ## Gateway retries
 
 The generated LiteLLM config retries only transient server errors (5xx, 503), once. Timeouts are not retried by the gateway: a timed-out generation usually means the backend is saturated, a retry adds load, and the harness's own per-call timeouts (45-120 s) are at or below the gateway's 120 s, so a gateway retry would arrive after the caller has given up anyway.
+
+## Orch-only profiles (evidence runs)
+
+The evidence runs (EV2 onwards) call only `orch-model`; their synthetic papers are written off the cluster. Two profiles
+serve it alone. Both use the orch settings of `agent-3x40` unchanged: the same pinned model and revision, context,
+memory fraction, limits and vLLM flags. The model identity, and with it every cache key, therefore stays the same.
+
+| Profile | GPUs | What it serves | Submit |
+| --- | --- | --- | --- |
+| `orch-1x40` | 1 | `orch-model` on GPU 0 | `LLM_SETUP_PROFILE=profiles/orch-1x40.yaml sbatch --gres=gpu:ampere:1 slurm/llm-stack.sbatch` |
+| `orch-3x40` | 3 | `orch-model` on GPUs 0, 1 and 2 (ports 8001, 8002, 8003) | `LLM_SETUP_PROFILE=profiles/orch-3x40.yaml sbatch slurm/llm-stack.sbatch` |
+
+The command-line `--gres` overrides the script's `#SBATCH --gres=gpu:ampere:3`.
+
+In `orch-3x40`, LiteLLM balances `orch-model` over the three replicas (`least-busy`), so up to three independent orch
+workloads can run at once. It also exposes `orch-model-1`, `-2` and `-3` to pin one replica. The callers send
+`orch-model` and need no change.
+
+Each replica has the per-GPU limits of `agent-3x40` (8 active, 8 queued). Replicas are separate vLLM processes with
+the same weights at temperature 0, but batching can still make two replicas give slightly different outputs.
+Results are cached by the pinned identity, not by the replica.

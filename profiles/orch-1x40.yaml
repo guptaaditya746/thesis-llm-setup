@@ -1,0 +1,30 @@
+# orch-model only, one GPU: the EV2 evidence runs use no other model (papers are written off the cluster).
+# The orch settings are agent-3x40's, unchanged. Submit with: sbatch --gres=gpu:ampere:1 ... (see MODEL_PROFILES.md).
+name: orch-1x40
+bind_host: 127.0.0.1
+gateway:
+  host: 127.0.0.1
+  port: 4000
+status:
+  host: 127.0.0.1
+  port: 8010
+models:
+  orch:
+    alias: orch-model
+    model: Qwen/Qwen3.8-27B-FP8
+    revision: 017b9c7af6b5689d5dd426a76e0bc077eb5ca20a
+    gpu: 0
+    port: 8001
+    max_num_active_seqs: 8
+    max_num_queued_reqs: 8
+    max_model_len: 65536
+    gpu_memory_utilization: 0.92
+    kv_cache_dtype: auto
+    extra_args:
+      - --reasoning-parser
+      - qwen3
+      - --generation-config
+      - vllm
+      - --enable-prefix-caching
+storage:
+  database: runtime/status.sqlite3

@@ -1,0 +1,37 @@
+# orch-model on all three GPUs: three replicas of the same pinned weights behind one alias, so
+# independent orch workloads (engine, agentic extractor, baselines) can run at once. The orch
+# settings are agent-3x40's, unchanged; LiteLLM routes orch-model to the least busy replica and also
+# exposes orch-model-1/-2/-3 for pinning.
+name: orch-3x40
+bind_host: 127.0.0.1
+gateway:
+  host: 127.0.0.1
+  port: 4000
+status:
+  host: 127.0.0.1
+  port: 8010
+models:
+  orch:
+    alias: orch-model
+    model: Qwen/Qwen3.8-27B-FP8
+    revision: 017b9c7af6b5689d5dd426a76e0bc077eb5ca20a
+    gpu: 0
+    port: 8001
+    replicas:
+      - gpu: 1
+        port: 8002
+      - gpu: 2
+        port: 8003
+    max_num_active_seqs: 8
+    max_num_queued_reqs: 8
+    max_model_len: 65536
+    gpu_memory_utilization: 0.92
+    kv_cache_dtype: auto
+    extra_args:
+      - --reasoning-parser
+      - qwen3
+      - --generation-config
+      - vllm
+      - --enable-prefix-caching
+storage:
+  database: runtime/status.sqlite3
