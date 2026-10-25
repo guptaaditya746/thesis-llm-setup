@@ -39,5 +39,18 @@ models:
     gpu_memory_utilization: 0.92
     kv_cache_dtype: auto
     tool_call_parser: hermes
+# GLiNER (named entities for the thesis evidence engine) as a small HTTP service on 127.0.0.1:8090,
+# sharing a GPU with a model. Off: uncomment to start it after the models are ready (the batch job
+# then installs the gliner extra). Its weights and its backbone's tokenizer (microsoft/deberta-v3-base)
+# must be in the Hugging Face cache first: it loads offline. See docs/OPERATIONS.md, "GLiNER".
+# GLiNER needs an estimated 1.5-2 GB on its GPU (not yet measured); at gpu_memory_utilization 0.92 a 40 GB A100 has about 3 GB
+# left, and a model restarted while GLiNER runs finds less free memory. Lower that model's
+# gpu_memory_utilization (for example to 0.88) if it fails to restart.
+# gliner:
+#   enabled: true
+#   gpu: 0
+#   port: 8090
+#   model: urchade/gliner_medium-v2.1
+#   revision: 40ec419335d09393f298636f471328b722c6da9e
 storage:
   database: runtime/status.sqlite3

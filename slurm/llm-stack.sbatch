@@ -20,6 +20,7 @@
 set -euo pipefail
 cd "${SLURM_SUBMIT_DIR:-$PWD}"
 stamp() { echo "[$(date +%H:%M:%S)] $*"; }
+PROFILE="${LLM_SETUP_PROFILE:-profiles/a100-3x40.yaml}"
 
 # vLLM normally asks the kernel for an ephemeral rendezvous port, closes the
 # probing socket, then binds that port in torch.distributed. Another process
@@ -42,8 +43,14 @@ stamp "ports from a workstation:  ssh -L 4000:127.0.0.1:4000 -L 8010:127.0.0.1:8
 stamp "installing Python and the serving environment on node-local scratch (a few minutes)"
 uv python install 3.13
 uv sync --python 3.13 --extra serve
+# A service the profile enables beyond the models (GLiNER: gliner.enabled: true) needs its extra too.
+extras="$("$UV_PROJECT_ENVIRONMENT/bin/llm-setup" profile extras --profile "$PROFILE")"
+if [ -n "$extras" ]; then
+  stamp "the profile enables: $extras; installing those extras"
+  uv sync --python 3.13 --extra serve $(for extra in $extras; do printf -- '--extra %s ' "$extra"; done)
+fi
 
 # llm-setup replaces this shell, so Slurm's SIGTERM (scancel, the time limit) reaches it directly.
 export PATH="$UV_PROJECT_ENVIRONMENT/bin:$PATH"
 stamp "starting the stack in the foreground"
-exec "$UV_PROJECT_ENVIRONMENT/bin/llm-setup" start --profile "${LLM_SETUP_PROFILE:-profiles/a100-3x40.yaml}" --foreground
+exec "$UV_PROJECT_ENVIRONMENT/bin/llm-setup" start --profile "$PROFILE" --foreground

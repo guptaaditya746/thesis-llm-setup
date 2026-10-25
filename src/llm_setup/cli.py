@@ -15,7 +15,7 @@ import yaml
 
 from .history import History
 from .models import model_instances, model_targets
-from .profile import ProfileError, load_profile, validate_vllm_options
+from .profile import ProfileError, load_profile, profile_extras, validate_vllm_options
 from .status import StatusMonitor
 from .supervisor import clock, render_litellm, start, stop
 
@@ -184,6 +184,9 @@ def main() -> None:
     validate_sub = validate.add_subparsers(dest="profile_command", required=True)
     profile_validate = validate_sub.add_parser("validate")
     profile_validate.add_argument("--profile", required=True)
+    profile_extras_cmd = validate_sub.add_parser(
+        "extras", help="print the optional extras the profile's enabled services need (e.g. gliner)")
+    profile_extras_cmd.add_argument("--profile", required=True)
     for command in ("start", "verify", "smoke", "doctor"):
         cmd = sub.add_parser(command)
         cmd.add_argument("--profile", required=True)
@@ -203,7 +206,10 @@ def main() -> None:
     try:
         if args.command == "profile":
             profile = load_profile(args.profile)
-            print(f"Profile valid: {profile['name']}")
+            if args.profile_command == "extras":
+                print(" ".join(profile_extras(profile)))
+            else:
+                print(f"Profile valid: {profile['name']}")
         elif args.command == "start":
             started = time.monotonic()
 

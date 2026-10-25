@@ -1583,6 +1583,26 @@ wheels = [
 ]
 
 [[package]]
+name = "gliner"
+version = "0.2.29"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "huggingface-hub" },
+    { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13'" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13'" },
+    { name = "packaging" },
+    { name = "safetensors" },
+    { name = "sentencepiece" },
+    { name = "torch" },
+    { name = "tqdm" },
+    { name = "transformers" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/93/02/ab43b9ad919d3cc1bcbb35485b2cdf7508ede0cddcebf72e765711795c30/gliner-0.2.29.tar.gz", hash = "sha256:39fa8f33c027627e1d6724bff972ab197bf37cea27e401cd3d40f2f95909b0a4", size = 299687, upload-time = "2026-09-08T12:50:50.113Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/78/76/74ec5493e2167350c53a51c0f1db8e6a096c1b99f7110e2d9fc7daaf5cdc/gliner-0.2.29-py3-none-any.whl", hash = "sha256:0c8cfb9f5c2daf7aff329ebb5ab1609052d7ad0aca0ef26049b9476b018b3fde", size = 261988, upload-time = "2026-09-08T12:50:48.514Z" },
+]
+
+[[package]]
 name = "googleapis-common-protos"
 version = "1.75.3"
 source = { registry = "https://pypi.org/simple" }
@@ -2424,6 +2444,9 @@ dev = [
     { name = "pytest" },
     { name = "ruff" },
 ]
+gliner = [
+    { name = "gliner" },
+]
 serve = [
     { name = "litellm", extra = ["proxy"] },
     { name = "vllm" },
@@ -2432,6 +2455,7 @@ serve = [
 [package.metadata]
 requires-dist = [
     { name = "fastapi", specifier = ">=0.115" },
+    { name = "gliner", marker = "extra == 'gliner'", specifier = "==0.2.29" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "litellm", extras = ["proxy"], marker = "extra == 'serve'", specifier = ">=1.92" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
@@ -2440,7 +2464,7 @@ requires-dist = [
     { name = "uvicorn", specifier = ">=0.30" },
     { name = "vllm", marker = "extra == 'serve'", specifier = "==0.21.0" },
 ]
-provides-extras = ["serve", "dev"]
+provides-extras = ["serve", "dev", "gliner"]
 
 [[package]]
 name = "llvmlite"

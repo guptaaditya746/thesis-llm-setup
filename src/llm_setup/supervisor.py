@@ -22,6 +22,7 @@ import yaml
 from .models import model_instances
 from .phases import current_phase, tail
 from .process import process_matches
+from .profile import gliner_settings
 
 # A timeout or a rate limit means the backend is already saturated; retrying
 # it from the gateway only adds load and hides the wait from the caller, who
@@ -84,7 +85,8 @@ def _command(role: str, item: dict[str, Any], session: Path) -> list[str]:
     return command
 
 
-def _vllm_environment(base: dict[str, str], item: dict[str, Any], session_id: str) -> dict[str, str]:
+def _gpu_environment(base: dict[str, str], gpu: int, session_id: str) -> dict[str, str]:
+    """A model process's environment: no gateway keys, offline Hugging Face loading, one GPU."""
     child_env = base.copy()
     child_env.pop("LITELLM_MASTER_KEY", None)
     child_env.pop("LLM_BACKEND_KEY", None)
@@ -92,7 +94,12 @@ def _vllm_environment(base: dict[str, str], item: dict[str, Any], session_id: st
     child_env["HF_TOKEN"] = base.get("HF_TOKEN", "")
     child_env["HF_HUB_OFFLINE"] = "1"
     child_env["LLM_SETUP_SESSION_ID"] = session_id
-    child_env["CUDA_VISIBLE_DEVICES"] = str(item["gpu"])
+    child_env["CUDA_VISIBLE_DEVICES"] = str(gpu)
+    return child_env
+
+
+def _vllm_environment(base: dict[str, str], item: dict[str, Any], session_id: str) -> dict[str, str]:
+    child_env = _gpu_environment(base, item["gpu"], session_id)
     # FlashInfer's sampler JIT-compiles on first request and requires nvcc. Many
     # Slurm runtime images have CUDA drivers but not the CUDA toolkit. The native
     # PyTorch sampler avoids that runtime compiler dependency. Operators may
@@ -126,7 +133,8 @@ def _failure_hint(log_path: Path | None) -> str:
 
 
 # How long a service may take to answer its health check after launch.
-STARTUP_TIMEOUT_S = {"embed": 1800, "heavy": 1800, "lite": 1800, "gateway": 180, "status": 60}
+STARTUP_TIMEOUT_S = {"embed": 1800, "heavy": 1800, "lite": 1800, "gateway": 180, "status": 60,
+                     "gliner": 900}
 Say = Callable[[str], None]
 
 
@@ -189,6 +197,15 @@ def build_services(profile: dict[str, Any], env: dict[str, str], session: Path, 
         services[name] = Service(name, _command(role, item, session), _vllm_environment(base, item, session_id),
                                  session / f"{name}.log", f"http://127.0.0.1:{item['port']}/health",
                                  max(STARTUP_TIMEOUT_S.get(role, 1800), 1800))
+    gliner = gliner_settings(profile)
+    if gliner:
+        command = [sys.executable, "-m", "llm_setup.gliner_server", "--model", gliner["model"],
+                   "--port", str(gliner["port"])]
+        if gliner.get("revision"):
+            command += ["--revision", gliner["revision"]]
+        services["gliner"] = Service("gliner", command, _gpu_environment(base, gliner["gpu"], session_id),
+                                     session / "gliner.log", f"http://127.0.0.1:{gliner['port']}/health",
+                                     STARTUP_TIMEOUT_S["gliner"])
     gateway_env = {k: v for k, v in base.items() if k != "HF_TOKEN"}
     gateway_env.update({"LLM_SETUP_SESSION_ID": session_id, "LLM_BACKEND_KEY": key, "LITELLM_MASTER_KEY": key})
     services["gateway"] = Service(
@@ -286,7 +303,8 @@ def record_event(session: Path, service: str, event: str, detail: str = "") -> d
 
 
 def start(profile_path: str | Path, profile: dict[str, Any], env: dict[str, str], say: Say = print) -> Session:
-    """Launch the three models in parallel, then the gateway and the status API, with progress."""
+    """Launch the models in parallel, then GLiNER when enabled, the gateway and the status API, with
+    progress."""
     key = env.get("LITELLM_MASTER_KEY", "")
     if not key or key == "replace-with-a-local-secret":
         raise RuntimeError("set a non-placeholder LITELLM_MASTER_KEY before start")
@@ -295,6 +313,9 @@ def start(profile_path: str | Path, profile: dict[str, Any], env: dict[str, str]
     clear_stale(root, say)
     ports = {item["name"]: item["port"] for item in model_instances(profile)}
     ports.update(gateway=profile["gateway"]["port"], status=profile["status"]["port"])
+    gliner = gliner_settings(profile)
+    if gliner:
+        ports["gliner"] = gliner["port"]
     busy = [f"{name} :{port}" for name, port in ports.items() if port_in_use(port)]
     if busy:
         raise RuntimeError(f"ports already in use: {', '.join(busy)}; another server (or a session that was "
@@ -314,13 +335,21 @@ def start(profile_path: str | Path, profile: dict[str, Any], env: dict[str, str]
     say(f"session {session_id} on {socket.gethostname()}; logs in {path}")
     record_event(path, "session", "starting", socket.gethostname())
     try:
-        models = [service for name, service in session.services.items() if name not in {"gateway", "status"}]
+        models = [service for name, service in session.services.items()
+                  if name not in {"gateway", "status", "gliner"}]
         for service in models:
             service.launch()
         session.save()
         say("models: " + ", ".join(f"{item['name']} on GPU {item['gpu']}" for item in model_instances(profile))
             + " (loading in parallel; usually 5-20 min)")
         wait_ready(models, say)
+        if gliner:
+            # After the models: vLLM sizes its memory from what is free when it starts, and GLiNER
+            # (an estimated 1.5-2 GB) fits in what the model on its GPU leaves.
+            say(f"gliner: {gliner['model']} on GPU {gliner['gpu']}, port {gliner['port']}")
+            session.services["gliner"].launch()
+            session.save()
+            wait_ready([session.services["gliner"]], say)
         for name in ("gateway", "status"):
             session.services[name].launch()
             session.save()

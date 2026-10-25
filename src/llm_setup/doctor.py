@@ -18,7 +18,7 @@ from typing import Any
 import httpx
 
 from .models import model_instances
-from .profile import load_profile
+from .profile import gliner_settings, load_profile
 from .supervisor import port_in_use, recorded_alive
 
 Row = tuple[str, str, str]                     # level, check, detail
@@ -49,6 +49,30 @@ def hf_cache() -> Path:
 def weights_cached(model_id: str, cache: Path) -> bool:
     snapshots = cache / ("models--" + model_id.replace("/", "--")) / "snapshots"
     return snapshots.is_dir() and any(snapshots.iterdir())
+
+
+def _gliner_weights(model_id: str, cache: Path) -> list[Row]:
+    """GLiNER loads offline: its weights and its backbone's tokenizer (named in gliner_config.json)
+    must both be in the cache."""
+    snapshots = cache / ("models--" + model_id.replace("/", "--")) / "snapshots"
+    if not weights_cached(model_id, cache):
+        return [("FAIL", "weights gliner", (f"{model_id} is not in {cache}; GLiNER loads offline, so "
+                                            f"`huggingface-cli download {model_id}` first (OPERATIONS.md)"))]
+    rows: list[Row] = [("PASS", "weights gliner", model_id)]
+    backbone = None
+    for config in sorted(snapshots.glob("*/gliner_config.json")):
+        try:
+            backbone = json.loads(config.read_text(encoding="utf-8")).get("model_name")
+        except (OSError, ValueError):
+            continue
+        if backbone:
+            break
+    if backbone and not weights_cached(backbone, cache):
+        rows.append(("WARN", "weights gliner backbone", (f"{backbone} (its tokenizer) is not in {cache}; "
+                     f"`huggingface-cli download {backbone}` or GLiNER fails to load offline")))
+    elif backbone:
+        rows.append(("PASS", "weights gliner backbone", backbone))
+    return rows
 
 
 def checks(profile_path: str, *, run: Callable[[list[str]], str | None] = _run,
@@ -86,6 +110,7 @@ def checks(profile_path: str, *, run: Callable[[list[str]], str | None] = _run,
         rows.append(("WARN", "session", (f"{session_id} is recorded but none of its processes is alive "
                                          "(the allocation ended or it crashed); the next start clears it")))
     running = bool(alive)
+    gliner = gliner_settings(profile)
 
     gpus = run(["nvidia-smi", "--query-gpu=index,memory.used,memory.total", "--format=csv,noheader,nounits"])
     if gpus is None:
@@ -96,8 +121,10 @@ def checks(profile_path: str, *, run: Callable[[list[str]], str | None] = _run,
             parts = [part.strip() for part in line.split(",")]
             if len(parts) == 3 and parts[0].isdigit():
                 found[int(parts[0])] = (int(parts[1]), int(parts[2]))
-        for item in model_instances(profile):
-            role, gpu = item["name"], item["gpu"]
+        placed = [(item["name"], item["gpu"]) for item in model_instances(profile)]
+        if gliner:
+            placed.append(("gliner", gliner["gpu"]))
+        for role, gpu in placed:
             if gpu not in found:
                 rows.append(("FAIL", f"GPU {gpu} ({role})", f"not visible; the allocation shows {sorted(found)}"))
             elif not running and found[gpu][0] > 2048:
@@ -112,9 +139,13 @@ def checks(profile_path: str, *, run: Callable[[list[str]], str | None] = _run,
             rows.append(("PASS", f"weights {role}", item["model"]))
         else:
             rows.append(("WARN", f"weights {role}", f"{item['model']} is not in {cache}; start will download it"))
+    if gliner:
+        rows.extend(_gliner_weights(gliner["model"], cache))
 
     ports = {item["name"]: item["port"] for item in model_instances(profile)}
     ports.update(gateway=profile["gateway"]["port"], status=profile["status"]["port"])
+    if gliner:
+        ports["gliner"] = gliner["port"]
     if not running:
         for name, port in ports.items():
             if port_in_use(port):
@@ -127,6 +158,10 @@ def checks(profile_path: str, *, run: Callable[[list[str]], str | None] = _run,
         response = get(f"http://127.0.0.1:{item['port']}/health")
         rows.append(("PASS", f"{role} health", "ok") if response is not None and response.is_success else
                     ("FAIL", f"{role} health", "no answer; `llm-setup logs --service " + role + "`"))
+    if gliner:
+        response = get(f"http://127.0.0.1:{gliner['port']}/health")
+        rows.append(("PASS", "gliner health", "ok") if response is not None and response.is_success else
+                    ("FAIL", "gliner health", "no answer; `llm-setup logs --service gliner`"))
     gateway = profile["gateway"]["port"]
     response = get(f"http://127.0.0.1:{gateway}/health/liveliness")
     rows.append(("PASS", "gateway", "alive") if response is not None and response.is_success else

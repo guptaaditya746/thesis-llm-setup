@@ -19,6 +19,11 @@ _DEFAULT_VLLM_HELP_TIMEOUT_SECONDS = 600
 KV_CACHE_DTYPES = {"auto", "fp8", "fp8_e4m3", "fp8_e5m2"}
 # vLLM tool-call parser names look like "hermes", "granite4", "granite-20b-fc".
 _PARSER_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
+# The optional GLiNER service (gliner_server.py): off unless a profile sets gliner.enabled: true. It
+# shares a GPU with a model. The revision pins the default model; another model brings its own.
+GLINER_DEFAULTS: dict[str, Any] = {"enabled": False, "gpu": 0, "port": 8090,
+                                   "model": "urchade/gliner_medium-v2.1",
+                                   "revision": "40ec419335d09393f298636f471328b722c6da9e"}
 
 
 class ProfileError(ValueError):
@@ -44,7 +49,7 @@ def load_profile(path: str | Path, *, check_vllm: bool = False) -> dict[str, Any
 def validate_profile(data: Any) -> None:
     if not isinstance(data, dict) or not isinstance(data.get("models"), dict) or not data["models"]:
         raise ProfileError("profile.models must define at least one role")
-    allowed = {"name", "bind_host", "gateway", "status", "models", "storage"}
+    allowed = {"name", "bind_host", "gateway", "status", "models", "storage", "gliner"}
     unknown = set(data) - allowed
     if unknown:
         raise ProfileError(f"unsupported profile fields: {', '.join(sorted(unknown))}")
@@ -63,7 +68,7 @@ def validate_profile(data: Any) -> None:
     for role, model in data["models"].items():
         if not isinstance(role, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", role):
             raise ProfileError(f"invalid model role name: {role!r}")
-        if role in {"gateway", "status"}:
+        if role in {"gateway", "status", "gliner"}:
             raise ProfileError(f"models.{role} conflicts with a reserved service name")
         expected_alias = ALIASES.get(role)
         if not isinstance(model, dict):
@@ -139,6 +144,9 @@ def validate_profile(data: Any) -> None:
             raise ProfileError(f"{name} must define only host and port")
     endpoints = [data["gateway"], data["status"]]
     endpoints += [{"host": "127.0.0.1", "port": p} for p in used_ports]
+    gliner = _validate_gliner(data.get("gliner"), used_gpus)
+    if gliner:
+        endpoints.append({"host": "127.0.0.1", "port": gliner["port"]})
     if any(e.get("host") != "127.0.0.1" for e in endpoints):
         raise ProfileError("all service hosts must be 127.0.0.1")
     ports = [e.get("port") for e in endpoints]
@@ -150,6 +158,52 @@ def validate_profile(data: Any) -> None:
         raise ProfileError("model task, when set, must be embed")
     if "embed" in data["models"] and data["models"]["embed"].get("task") != "embed":
         raise ProfileError("models.embed.task must be embed")
+
+
+def _validate_gliner(section: Any, model_gpus: set[int]) -> dict[str, Any] | None:
+    """Check the optional gliner section; return its settings when it is enabled."""
+    if section is None:
+        return None
+    if not isinstance(section, dict):
+        raise ProfileError("gliner must be a mapping")
+    unknown = set(section) - set(GLINER_DEFAULTS)
+    if unknown:
+        raise ProfileError(f"unsupported gliner fields: {', '.join(sorted(unknown))}")
+    if "enabled" in section and type(section["enabled"]) is not bool:
+        raise ProfileError("gliner.enabled must be true or false")
+    for key, minimum in (("gpu", 0), ("port", 1)):
+        if key in section and (type(section[key]) is not int or section[key] < minimum):
+            raise ProfileError(f"gliner.{key} must be a positive integer")
+    for key in ("model", "revision"):
+        if key in section and (not isinstance(section[key], str) or not section[key].strip()):
+            raise ProfileError(f"gliner.{key} must be a non-empty string")
+    settings = _gliner_merge(section)
+    if not settings["enabled"]:
+        return None
+    if settings["gpu"] not in model_gpus:
+        raise ProfileError(f"gliner.gpu: GPU {settings['gpu']} serves no model; GLiNER shares a model's GPU")
+    return settings
+
+
+def _gliner_merge(section: dict[str, Any]) -> dict[str, Any]:
+    settings = {**GLINER_DEFAULTS, **section}
+    if "model" in section and "revision" not in section and section["model"] != GLINER_DEFAULTS["model"]:
+        settings["revision"] = None
+    return settings
+
+
+def gliner_settings(profile: dict[str, Any]) -> dict[str, Any] | None:
+    """The GLiNER service settings (defaults filled in) when the profile enables it, else None."""
+    section = profile.get("gliner")
+    if not isinstance(section, dict):
+        return None
+    settings = _gliner_merge(section)
+    return settings if settings["enabled"] is True else None
+
+
+def profile_extras(profile: dict[str, Any]) -> list[str]:
+    """Optional dependency extras the profile's enabled services need, beyond `serve`."""
+    return ["gliner"] if gliner_settings(profile) else []
 
 
 def uses_kv_cache_dtype(profile: dict[str, Any] | None) -> bool:

@@ -78,3 +78,45 @@ curl -s http://127.0.0.1:8010/v1/status | python3 -m json.tool
 ```
 
 For Lite use port 8003, `ibm-granite/granite-4.1-8b` and `lite-model`. Record time to first token, time per output token and throughput per concurrency level, plus the `preemptions` and `kvCache` values from `/v1/status`. Set `max_num_active_seqs` at the last level where time to first token stays acceptable and preemptions stay at zero.
+
+## GLiNER
+
+An optional named-entity service for the thesis evidence engine (`src/llm_setup/gliner_server.py`). It
+is off in every profile; a profile turns it on with a `gliner` section:
+
+```yaml
+gliner:
+  enabled: true
+  gpu: 0                                   # a GPU that already serves a model: it shares it
+  port: 8090                               # loopback only, like every service
+  model: urchade/gliner_medium-v2.1        # the default
+  revision: 40ec419335d09393f298636f471328b722c6da9e   # pinned; the default for the default model
+```
+
+`profiles/agent-3x40.yaml` carries this block commented out. With it enabled:
+
+- the batch job runs `llm-setup profile extras --profile <profile>` after the usual install and, since it
+  prints `gliner`, installs the `gliner` extra too (`uv sync --python 3.13 --extra serve --extra gliner`).
+  GLiNER uses the torch that vLLM pins (`serve`), so there is no separate PyTorch CUDA index; an install of
+  `--extra gliner` alone gets torch from PyPI, whose Linux wheels carry their own CUDA libraries;
+- `start` launches it after the models answer `/health` (vLLM sizes its memory from what is free when it
+  starts) and before the gateway, as service `gliner` with its own log (`llm-setup logs --service gliner`);
+  the watchdog restarts it like a model; `doctor` checks its GPU, port, weights and `/health`;
+- it loads offline (`HF_HUB_OFFLINE=1`, as vLLM does), so download the weights and the backbone's
+  tokenizer once, on a login node:
+
+```sh
+huggingface-cli download urchade/gliner_medium-v2.1 --revision 40ec419335d09393f298636f471328b722c6da9e
+huggingface-cli download microsoft/deberta-v3-base config.json tokenizer_config.json spm.model
+```
+
+Its API (`127.0.0.1:8090`, from the same node or through an SSH tunnel): `GET /health`,
+`GET /info` -> `{"model", "revision", "device"}`, and `POST /predict` with
+`{"text": str, "labels": [str], "threshold": 0.5}` -> `{"entities": [{"start", "end", "text", "label",
+"score"}]}`, character offsets into `text`. The evidence engine reads it from `GLINER_URL`
+(`export GLINER_URL=http://127.0.0.1:8090`).
+
+GLiNER needs an estimated 1.5-2 GB on its GPU (not yet measured: check `nvidia-smi` once it runs). A model
+at `gpu_memory_utilization: 0.92` leaves about 3 GB of a 40 GB A100, and a model restarted while GLiNER
+runs finds less free memory than at the first start; lower that model's `gpu_memory_utilization` (for
+example to 0.88) if it fails to restart.

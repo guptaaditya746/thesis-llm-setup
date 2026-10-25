@@ -32,6 +32,12 @@ The harness agent loop sends OpenAI-style `tools` with `tool_choice: "auto"` to 
 
 The launcher then adds `--enable-auto-tool-choice --tool-call-parser <name>`, and `verify` checks the parser exists in the installed vLLM. `smoke` sends one tool-calling request per such role.
 
+## GLiNER
+
+A profile may add a `gliner` section (`enabled`, `gpu`, `port`, `model`, `revision`; off by default) for
+the optional named-entity service. It shares the GPU of a model (validation refuses a GPU without one) and
+needs its own free port. See `OPERATIONS.md`, "GLiNER".
+
 ## Validation
 
 Validation rejects unknown profile fields, zero or unbounded queue settings, and unknown KV-cache dtypes, and checks the required vLLM flags (including `--kv-cache-dtype` when used) against the installed CLI before launch. Active and queued limits are configurable positive integers. Benchmark representative requests before increasing context, GPU memory use, or concurrency (see `OPERATIONS.md`, "Load test"). Queue admission must remain finite.
