@@ -190,7 +190,8 @@ def checks(profile_path: str, *, run: Callable[[list[str]], str | None] = _run,
     events = root / session_id / "events.jsonl"
     if events.exists():
         recent = [json.loads(line) for line in events.read_text(encoding="utf-8").splitlines()[-5:] if line.strip()]
-        restarts = [row for row in recent if row.get("event") in {"exited", "exited again", "gave up restarting"}]
+        restarts = [row for row in recent if row.get("event") in {"exited", "exited again", "gave up restarting",
+                                                                "start failed"}]
         if restarts:
             rows.append(("WARN", "recent events", "; ".join(f"{row['time']} {row['service']} {row['event']}"
                                                             for row in restarts)))

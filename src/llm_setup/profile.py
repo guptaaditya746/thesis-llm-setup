@@ -23,7 +23,8 @@ _PARSER_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
 # shares a GPU with a model. The revision pins the default model; another model brings its own.
 GLINER_DEFAULTS: dict[str, Any] = {"enabled": False, "gpu": 0, "port": 8090,
                                    "model": "urchade/gliner_medium-v2.1",
-                                   "revision": "40ec419335d09393f298636f471328b722c6da9e"}
+                                   "revision": "40ec419335d09393f298636f471328b722c6da9e",
+                                   "max_chars": 1500}   # longer /predict texts get HTTP 413
 
 
 class ProfileError(ValueError):
@@ -171,7 +172,7 @@ def _validate_gliner(section: Any, model_gpus: set[int]) -> dict[str, Any] | Non
         raise ProfileError(f"unsupported gliner fields: {', '.join(sorted(unknown))}")
     if "enabled" in section and type(section["enabled"]) is not bool:
         raise ProfileError("gliner.enabled must be true or false")
-    for key, minimum in (("gpu", 0), ("port", 1)):
+    for key, minimum in (("gpu", 0), ("port", 1), ("max_chars", 1)):
         if key in section and (type(section[key]) is not int or section[key] < minimum):
             raise ProfileError(f"gliner.{key} must be a positive integer")
     for key in ("model", "revision"):

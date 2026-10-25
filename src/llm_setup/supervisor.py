@@ -200,7 +200,7 @@ def build_services(profile: dict[str, Any], env: dict[str, str], session: Path, 
     gliner = gliner_settings(profile)
     if gliner:
         command = [sys.executable, "-m", "llm_setup.gliner_server", "--model", gliner["model"],
-                   "--port", str(gliner["port"])]
+                   "--port", str(gliner["port"]), "--max-chars", str(gliner["max_chars"])]
         if gliner.get("revision"):
             command += ["--revision", gliner["revision"]]
         services["gliner"] = Service("gliner", command, _gpu_environment(base, gliner["gpu"], session_id),
@@ -347,9 +347,7 @@ def start(profile_path: str | Path, profile: dict[str, Any], env: dict[str, str]
             # After the models: vLLM sizes its memory from what is free when it starts, and GLiNER
             # (an estimated 1.5-2 GB) fits in what the model on its GPU leaves.
             say(f"gliner: {gliner['model']} on GPU {gliner['gpu']}, port {gliner['port']}")
-            session.services["gliner"].launch()
-            session.save()
-            wait_ready([session.services["gliner"]], say)
+            start_optional(session, session.services["gliner"], say)
         for name in ("gateway", "status"):
             session.services[name].launch()
             session.save()
@@ -365,6 +363,26 @@ def start(profile_path: str | Path, profile: dict[str, Any], env: dict[str, str]
         if isinstance(exc, KeyboardInterrupt):
             raise
         raise RuntimeError(f"startup failed in session {session_id}: {exc}\nlogs: {path}") from exc
+
+
+def start_optional(session: Session, service: Service, say: Say) -> bool:
+    """Start a service the models do not need (GLiNER). If it fails to become healthy it is stopped,
+    marked failed (the watchdog leaves it alone) and recorded, and the stack starts without it."""
+    service.launch()
+    session.save()
+    try:
+        wait_ready([service], say)
+        return True
+    except RuntimeError as exc:
+        process = service.process
+        if process is not None and process.poll() is None and process_matches(process.pid, session.id):
+            signal_owned(process.pid, signal.SIGTERM)
+        service.state = "failed"
+        first = str(exc).splitlines()[0][:300]
+        record_event(session.path, service.name, "start failed", first)
+        say(f"{service.name}: start failed, continuing without it ({first}); "
+            f"`llm-setup logs --service {service.name}`")
+        return False
 
 
 def terminate(session: Session, say: Say = print, grace_s: float = 30.0) -> list[str]:

@@ -52,5 +52,6 @@ models:
 #   port: 8090
 #   model: urchade/gliner_medium-v2.1
 #   revision: 40ec419335d09393f298636f471328b722c6da9e
+#   max_chars: 1500
 storage:
   database: runtime/status.sqlite3

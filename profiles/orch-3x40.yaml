@@ -33,5 +33,20 @@ models:
       - --generation-config
       - vllm
       - --enable-prefix-caching
+# GLiNER (named entities for the thesis evidence engine) as a small HTTP service on 127.0.0.1:8090,
+# sharing GPU 0 with the first orch replica. Off: uncomment to start it after the models are ready (the
+# batch job then installs the gliner extra). Its weights and its backbone's tokenizer
+# (microsoft/deberta-v3-base) must be in the Hugging Face cache first: it loads offline. See
+# docs/OPERATIONS.md, "GLiNER", for the first-run checklist.
+# GLiNER needs an estimated 1.5-2 GB (not yet measured); at gpu_memory_utilization 0.92 a 40 GB A100
+# has about 3 GB left. That fraction is shared by all three orch replicas, so do not lower it here: if
+# GPU 0 has under ~1 GB free after start, use a copy of this profile (orch-3x40-gliner.yaml) at 0.88.
+# gliner:
+#   enabled: true
+#   gpu: 0
+#   port: 8090
+#   model: urchade/gliner_medium-v2.1
+#   revision: 40ec419335d09393f298636f471328b722c6da9e
+#   max_chars: 1500
 storage:
   database: runtime/status.sqlite3

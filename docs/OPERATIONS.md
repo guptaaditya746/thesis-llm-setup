@@ -91,9 +91,11 @@ gliner:
   port: 8090                               # loopback only, like every service
   model: urchade/gliner_medium-v2.1        # the default
   revision: 40ec419335d09393f298636f471328b722c6da9e   # pinned; the default for the default model
+  max_chars: 1500                          # longer /predict texts get HTTP 413, never a silent cut
 ```
 
-`profiles/agent-3x40.yaml` carries this block commented out. With it enabled:
+`profiles/orch-3x40.yaml` (the thesis stack) and `profiles/agent-3x40.yaml` carry this block commented out.
+With it enabled:
 
 - the batch job runs `llm-setup profile extras --profile <profile>` after the usual install and, since it
   prints `gliner`, installs the `gliner` extra too (`uv sync --python 3.13 --extra serve --extra gliner`).
@@ -101,7 +103,11 @@ gliner:
   `--extra gliner` alone gets torch from PyPI, whose Linux wheels carry their own CUDA libraries;
 - `start` launches it after the models answer `/health` (vLLM sizes its memory from what is free when it
   starts) and before the gateway, as service `gliner` with its own log (`llm-setup logs --service gliner`);
-  the watchdog restarts it like a model; `doctor` checks its GPU, port, weights and `/health`;
+  the watchdog restarts it like a model once it has been ready; `doctor` checks its GPU, port, weights
+  and `/health`, and `llm-setup status` shows a `gliner` row;
+- if it does not become healthy at start, the stack starts without it: it is stopped, marked failed (not
+  restarted), and `gliner: start failed, continuing without it` is printed and recorded in the events.
+  The evidence engine's GLiNER extractors then report the service as unavailable and the run goes on;
 - it loads offline (`HF_HUB_OFFLINE=1`, as vLLM does), so download the weights and the backbone's
   tokenizer once, on a login node:
 
@@ -113,10 +119,37 @@ huggingface-cli download microsoft/deberta-v3-base config.json tokenizer_config.
 Its API (`127.0.0.1:8090`, from the same node or through an SSH tunnel): `GET /health`,
 `GET /info` -> `{"model", "revision", "device"}`, and `POST /predict` with
 `{"text": str, "labels": [str], "threshold": 0.5}` -> `{"entities": [{"start", "end", "text", "label",
-"score"}]}`, character offsets into `text`. The evidence engine reads it from `GLINER_URL`
+"score"}]}`, character offsets into `text`. A text longer than `max_chars` (reported by `/info`) gets
+HTTP 413: GLiNER medium reads about 384 words and would drop the rest without saying so. The evidence engine reads it from `GLINER_URL`
 (`export GLINER_URL=http://127.0.0.1:8090`).
 
-GLiNER needs an estimated 1.5-2 GB on its GPU (not yet measured: check `nvidia-smi` once it runs). A model
-at `gpu_memory_utilization: 0.92` leaves about 3 GB of a 40 GB A100, and a model restarted while GLiNER
-runs finds less free memory than at the first start; lower that model's `gpu_memory_utilization` (for
-example to 0.88) if it fails to restart.
+GLiNER needs an estimated 1.5-2 GB on its GPU (not yet measured). A model at
+`gpu_memory_utilization: 0.92` leaves about 3 GB of a 40 GB A100, and a model restarted while GLiNER runs
+finds less free memory than at the first start.
+
+### First run
+
+1. On a login node, download the weights and the backbone tokenizer (commands above).
+2. In the allocation, before enabling it in a profile, load it on its own on a GPU with room (or before
+   the stack starts), offline as the supervisor runs it:
+
+   ```sh
+   uv sync --python 3.13 --extra serve --extra gliner
+   HF_HUB_OFFLINE=1 CUDA_VISIBLE_DEVICES=0 uv run python -m llm_setup.gliner_server \
+     --model urchade/gliner_medium-v2.1 --revision 40ec419335d09393f298636f471328b722c6da9e --port 8090 &
+   curl -s 127.0.0.1:8090/info
+   curl -s 127.0.0.1:8090/predict -H 'Content-Type: application/json' \
+     -d '{"text": "We evaluate RAG on SQuAD.", "labels": ["method", "dataset"], "threshold": 0.5}'
+   kill %1
+   ```
+
+   An error here (missing files offline, a gliner/transformers mismatch) is cheaper than in a batch job.
+3. Uncomment the `gliner:` block in the profile, start the batch job, then on the node run
+   `uv run llm-setup doctor --profile <profile>`: `gliner health ok`, no `gliner start failed` event.
+4. Check the memory on GLiNER's GPU: `nvidia-smi --query-gpu=index,memory.used,memory.total
+   --format=csv`. Write down what GLiNER uses (`nvidia-smi` lists its process).
+5. If under about 1 GB stays free on that GPU, the model there may not come back after a watchdog restart.
+   In `orch-3x40` the orch `gpu_memory_utilization` applies to all three replicas, so do not edit
+   `orch-3x40.yaml`: copy it to `profiles/orch-3x40-gliner.yaml` with `gpu_memory_utilization: 0.88` and
+   the `gliner` block enabled, and start that (`LLM_SETUP_PROFILE=profiles/orch-3x40-gliner.yaml sbatch
+   slurm/llm-stack.sbatch`).

@@ -34,7 +34,7 @@ The launcher then adds `--enable-auto-tool-choice --tool-call-parser <name>`, an
 
 ## GLiNER
 
-A profile may add a `gliner` section (`enabled`, `gpu`, `port`, `model`, `revision`; off by default) for
+A profile may add a `gliner` section (`enabled`, `gpu`, `port`, `model`, `revision`, `max_chars`; off by default) for
 the optional named-entity service. It shares the GPU of a model (validation refuses a GPU without one) and
 needs its own free port. See `OPERATIONS.md`, "GLiNER".
 

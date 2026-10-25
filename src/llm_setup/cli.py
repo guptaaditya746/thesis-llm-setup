@@ -15,7 +15,13 @@ import yaml
 
 from .history import History
 from .models import model_instances, model_targets
-from .profile import ProfileError, load_profile, profile_extras, validate_vllm_options
+from .profile import (
+    ProfileError,
+    gliner_settings,
+    load_profile,
+    profile_extras,
+    validate_vllm_options,
+)
 from .status import StatusMonitor
 from .supervisor import clock, render_litellm, start, stop
 
@@ -45,6 +51,21 @@ def _gateway_aliases(port: int, key: str) -> set[str]:
     if not response.is_success:
         return set()
     return {entry.get("id") for entry in response.json().get("data", [])}
+
+
+def gliner_status_line(gliner: dict, entry: dict, session_id: str) -> str:
+    """The `status` row for the optional GLiNER service: its pid and whether /health answers."""
+    from .process import process_matches
+
+    pid = entry.get("pid", "-")
+    if isinstance(pid, int) and not process_matches(pid, session_id):
+        pid = "stale"
+    backend = f"http://127.0.0.1:{gliner['port']}"
+    try:
+        state = "ready" if httpx.get(f"{backend}/health", timeout=2).is_success else "unhealthy"
+    except httpx.HTTPError:
+        state = "down" if pid in {"-", "stale"} else "not answering"
+    return f"{'gliner':<12} {pid!s:<6} {state:<12} {'-':>7} {'-':>7} {'-':>8} {backend}"
 
 
 def _verify(profile_path: str) -> int:
@@ -291,6 +312,9 @@ def main() -> None:
                 print(f"{alias:<12} {pid!s:<6} {item['state']:<12} {item.get('running', '-'):>7} "
                       f"{item.get('waiting', '-'):>7} "
                       f"{item.get('kvCache', '-'):>8} {item['backend']}")
+            gliner = gliner_settings(profile)
+            if gliner:
+                print(gliner_status_line(gliner, services.get("gliner", {}), state.get("sessionId", "")))
     except KeyboardInterrupt:
         print("interrupted; processes of a session that did not finish starting were stopped", file=sys.stderr)
         sys.exit(130)

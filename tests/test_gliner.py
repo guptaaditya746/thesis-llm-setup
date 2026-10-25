@@ -95,7 +95,26 @@ def test_gliner_section_is_validated():
         validate_profile(data)
     with pytest.raises(ProfileError, match="gliner must be a mapping"):
         validate_profile({**agent_profile(), "gliner": True})
-    validate_profile(agent_profile(enabled=True, gpu=2, port=8091))
+    validate_profile(agent_profile(enabled=True, gpu=2, port=8091, max_chars=3000))
+    with pytest.raises(ProfileError, match="gliner.max_chars"):
+        validate_profile(agent_profile(enabled=True, max_chars=0))
+
+
+def test_orch_3x40_with_gliner_enabled_validates():
+    data = load_profile(ROOT / "profiles" / "orch-3x40.yaml")
+    assert gliner_settings(data) is None
+    data["gliner"] = {"enabled": True, "gpu": 0, "port": 8090}
+    validate_profile(data)
+    settings = gliner_settings(data)
+    assert (settings["gpu"], settings["port"], settings["max_chars"]) == (0, 8090, 1500)
+    # The commented block in the file is the one documented: uncommented, it validates as is.
+    import yaml
+
+    text = (ROOT / "profiles" / "orch-3x40.yaml").read_text(encoding="utf-8")
+    block = "\n".join(line[2:] for line in text.splitlines() if line.startswith(("# gliner:", "#   ")))
+    data["gliner"] = yaml.safe_load(block)["gliner"]
+    validate_profile(data)
+    assert gliner_settings(data)["revision"] == GLINER_DEFAULTS["revision"]
 
 
 def test_cli_lists_the_extras_a_profile_needs(monkeypatch, tmp_path):
@@ -149,6 +168,21 @@ def test_predict_checks_its_input_and_skips_blank_text():
     # The threshold has a default, as GLiNER's own.
     assert http.post("/predict", json={"text": "SQuAD", "labels": ["dataset"]}).status_code == 200
     assert model.calls[-1][2] == 0.5
+
+
+def test_predict_refuses_text_longer_than_max_chars():
+    http, model = client()
+    assert http.get("/info").json()["max_chars"] == 1500
+    body = {"labels": ["dataset"], "threshold": 0.5}
+    assert http.post("/predict", json={**body, "text": "SQuAD " + "x" * 1494}).status_code == 200   # 1500
+    reply = http.post("/predict", json={**body, "text": "x" * 1501})
+    assert reply.status_code == 413 and "at most 1500" in reply.json()["detail"]
+    assert len(model.calls) == 1
+    from llm_setup.gliner_server import create_app
+
+    small = TestClient(create_app(FakeModel(), "m", max_chars=10))
+    assert small.post("/predict", json={**body, "text": "SQuAD SQuAD"}).status_code == 413
+    assert small.get("/info").json()["max_chars"] == 10
 
 
 def test_info_names_the_served_model_and_health_answers():
@@ -210,7 +244,7 @@ def test_gliner_service_is_built_only_when_enabled(tmp_path):
     assert list(services) == ["orch", "sub", "sub-2", "gliner", "gateway", "status"]
     gliner = services["gliner"]
     assert gliner.command == [sys.executable, "-m", "llm_setup.gliner_server", "--model",
-                              "urchade/gliner_medium-v2.1", "--port", "8090", "--revision",
+                              "urchade/gliner_medium-v2.1", "--port", "8090", "--max-chars", "1500", "--revision",
                               "40ec419335d09393f298636f471328b722c6da9e"]
     assert gliner.health == "http://127.0.0.1:8090/health"
     assert gliner.env["CUDA_VISIBLE_DEVICES"] == "2" and gliner.env["HF_HUB_OFFLINE"] == "1"
@@ -237,6 +271,45 @@ def test_start_launches_gliner_after_the_models_and_before_the_gateway(tmp_path,
     order.clear()
     supervisor.start("p.yaml", agent_profile(), {"LITELLM_MASTER_KEY": "k"}, say=said.append)
     assert order == [["orch", "sub", "sub-2"], ["gateway"], ["status"]]
+
+
+def test_a_gliner_start_failure_leaves_the_stack_running(tmp_path, monkeypatch):
+    import json
+
+    from llm_setup import supervisor
+    from llm_setup.watchdog import Watchdog
+
+    launched: list[str] = []
+
+    def wait_ready(services, say):
+        if services[0].name == "gliner":
+            raise RuntimeError("gliner exited with status 1 before it became healthy\n--- last lines ---")
+
+    monkeypatch.setattr(supervisor.Service, "launch", lambda self: launched.append(self.name))
+    monkeypatch.setattr(supervisor, "wait_ready", wait_ready)
+    monkeypatch.setattr(supervisor, "port_in_use", lambda port: False)
+    monkeypatch.chdir(tmp_path)
+    said: list[str] = []
+    session = supervisor.start("p.yaml", agent_profile(enabled=True), {"LITELLM_MASTER_KEY": "k"},
+                               say=said.append)
+    assert launched == ["orch", "sub", "sub-2", "gliner", "gateway", "status"]
+    assert session.services["gliner"].state == "failed"
+    assert (tmp_path / "runtime" / "current").read_text() == session.id
+    assert any(line.startswith("gliner: start failed, continuing without it") for line in said)
+    events = [json.loads(line) for line in (session.path / "events.jsonl").read_text().splitlines()]
+    assert {"service": "gliner", "event": "start failed"}.items() <= next(
+        e for e in events if e["service"] == "gliner").items()
+    assert events[-1]["event"] == "ready"
+    # The watchdog does not restart it.
+    Watchdog(session, said.append, "http://127.0.0.1:9/v1/status").check(session.services["gliner"])
+    assert launched.count("gliner") == 1
+
+
+def test_status_line_shows_a_gliner_that_is_down():
+    from llm_setup.cli import gliner_status_line
+
+    line = gliner_status_line({"port": 9}, {}, "s1")
+    assert line.split()[:3] == ["gliner", "-", "down"] and line.endswith("http://127.0.0.1:9")
 
 
 def test_start_refuses_a_busy_gliner_port(tmp_path, monkeypatch):
@@ -286,6 +359,13 @@ def test_doctor_checks_gliner_weights_backbone_and_health(tmp_path, monkeypatch)
     (runtime / "current").write_text("20261025T000000Z-abcdef12")
     rows = {name: level for level, name, _ in checks(str(path), run=run, get=lambda *a, **k: None, root=runtime)}
     assert rows["gliner health"] == "FAIL"
+    (runtime / "20261025T000000Z-abcdef12").mkdir()
+    from llm_setup.supervisor import record_event
+
+    record_event(runtime / "20261025T000000Z-abcdef12", "gliner", "start failed", "exited with status 1")
+    rows = {name: (level, detail) for level, name, detail in
+            checks(str(path), run=run, get=lambda *a, **k: None, root=runtime)}
+    assert rows["recent events"][0] == "WARN" and "gliner start failed" in rows["recent events"][1]
 
 
 def test_sbatch_installs_the_extras_the_profile_enables():
