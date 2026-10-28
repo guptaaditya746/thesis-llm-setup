@@ -192,9 +192,13 @@ def build_services(profile: dict[str, Any], env: dict[str, str], session: Path, 
                    key: str) -> dict[str, Service]:
     base = {**os.environ, **env}
     services: dict[str, Service] = {}
-    for item in model_instances(profile):
+    for index, item in enumerate(model_instances(profile)):
         name, role = item["name"], item["role"]
-        services[name] = Service(name, _command(role, item, session), _vllm_environment(base, item, session_id),
+        model_env = _vllm_environment(base, item, session_id)
+        if base.get("VLLM_PORT"):
+            # Parallel replicas need separate torch rendezvous ports, even within one Slurm job.
+            model_env["VLLM_PORT"] = str(int(base["VLLM_PORT"]) + index * 4)
+        services[name] = Service(name, _command(role, item, session), model_env,
                                  session / f"{name}.log", f"http://127.0.0.1:{item['port']}/health",
                                  max(STARTUP_TIMEOUT_S.get(role, 1800), 1800))
     gliner = gliner_settings(profile)
