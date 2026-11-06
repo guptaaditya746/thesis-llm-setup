@@ -86,13 +86,12 @@ def _command(role: str, item: dict[str, Any], session: Path) -> list[str]:
 
 
 def _gpu_environment(base: dict[str, str], gpu: int, session_id: str) -> dict[str, str]:
-    """A model process's environment: no gateway keys, offline Hugging Face loading, one GPU."""
+    """A model process's environment: no gateway keys, inherited Hugging Face settings, one GPU."""
     child_env = base.copy()
     child_env.pop("LITELLM_MASTER_KEY", None)
     child_env.pop("LLM_BACKEND_KEY", None)
     child_env.pop("VLLM_API_KEY", None)
     child_env["HF_TOKEN"] = base.get("HF_TOKEN", "")
-    child_env["HF_HUB_OFFLINE"] = "1"
     child_env["LLM_SETUP_SESSION_ID"] = session_id
     child_env["CUDA_VISIBLE_DEVICES"] = str(gpu)
     return child_env

@@ -247,7 +247,7 @@ def test_gliner_service_is_built_only_when_enabled(tmp_path):
                               "urchade/gliner_medium-v2.1", "--port", "8090", "--max-chars", "1500", "--revision",
                               "40ec419335d09393f298636f471328b722c6da9e"]
     assert gliner.health == "http://127.0.0.1:8090/health"
-    assert gliner.env["CUDA_VISIBLE_DEVICES"] == "2" and gliner.env["HF_HUB_OFFLINE"] == "1"
+    assert gliner.env["CUDA_VISIBLE_DEVICES"] == "2" and "HF_HUB_OFFLINE" not in gliner.env
     assert gliner.env["LLM_SETUP_SESSION_ID"] == "s1"
     assert "LITELLM_MASTER_KEY" not in gliner.env and "LLM_BACKEND_KEY" not in gliner.env
     assert gliner.log == tmp_path / "gliner.log"

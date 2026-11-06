@@ -34,6 +34,14 @@ if [ ! -f .env ]; then
   stamp "no .env in $PWD: copy .env.example to .env and set LITELLM_MASTER_KEY"; exit 1
 fi
 set -a; source .env; set +a
+
+# Minimal runtime containers may omit the C/C++ toolchain needed by Triton.
+# Opt in only for a writable Debian/Ubuntu container; native jobs are unchanged.
+if [ "${LLM_SETUP_BOOTSTRAP_COMPILER:-0}" = 1 ] && { ! command -v cc >/dev/null || ! command -v c++ >/dev/null; }; then
+  stamp "installing the compiler needed by Triton in the writable container"
+  apt-get update -qq
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends gcc g++ libc6-dev
+fi
 mkdir -p "$LLM_SETUP_LOCAL_ROOT"
 
 stamp "job ${SLURM_JOB_ID:-?} on $(hostname); GPUs: ${CUDA_VISIBLE_DEVICES:-none visible}"

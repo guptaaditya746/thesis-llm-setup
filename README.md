@@ -16,26 +16,41 @@ flowchart LR
 
 Heavy (`heavy-model`) handles quality schema inference, evidence review, and answer verification. Lite (`lite-model`) handles structured and EDC extraction, mapping, planning, and MCP control. Embed (`qwen-embed`) accepts embedding requests only.
 
-## Quick start: a Slurm batch job
+## Webis quick start: three Ampere GPUs and GLiNER
 
-The stack runs as a batch job, so it keeps running when your terminal or SSH connection closes, restarts a
-service that crashes, and stops cleanly at `scancel` or three minutes before the time limit.
+For the thesis stack use `profiles/orch-3x40-gliner.yaml`: three Qwen replicas behind
+`orch-model` and GLiNER on GPU 0. Each service listens on loopback. Check for existing
+jobs first and use the cluster-provided Enroot environment:
 
 ```sh
-cd /mnt/ceph/storage/data-tmp/current/xepi3167/thesis/final-final-llm-setup
-cp .env.example .env                       # once: set LITELLM_MASTER_KEY (and Hugging Face credentials)
-sbatch slurm/llm-stack.sbatch              # prints the job id
-tail -f runtime/slurm-<jobid>.out          # what it is doing: per-model phase every 15 s, then events
+cd ~/thesis/thesis-research-agent/llm-setup
+squeue -u "$USER"                         # avoid a duplicate stack
+# Create .env from .env.example only if it does not already exist; set LITELLM_MASTER_KEY.
+LLM_SETUP_PROFILE=profiles/orch-3x40-gliner.yaml LLM_SETUP_BOOTSTRAP_COMPILER=1 \
+  sbatch --partition=gammaweb --container-image=pytorch/pytorch:2.8.0-cuda12.9-cudnn9-runtime \
+  --container-writable --container-remap-root slurm/llm-stack.sbatch
+# Record the job ID printed by sbatch.
+tail -f runtime/slurm-<jobid>.out
 ```
 
-The log shows each model's phase while it loads (downloading, loading weights 63%, capturing CUDA graphs,
-ready after 4:12), then a line for every exit, restart and stop, and a summary every five minutes. For a shell
-on the same node (doctor, the harness, tunnels): `srun --jobid <jobid> --overlap --pty bash -l`, then
-`set -a; source .env; set +a` and `uv run llm-setup doctor --profile profiles/a100-3x40.yaml`.
-Stop with `scancel <jobid>`.
+The script requests `gpu:ampere:3`; do not switch to Hopper. Select a node with
+`--nodelist=<node>` when the pinned revisions are known to be available there. Check the
+container's cache environment on the selected compute node first: the institution provides
+`HF_HUB_CACHE`, `HF_DATASETS_CACHE` and `XDG_CACHE_HOME`. Never overwrite those variables,
+copy model weights into `/tmp`, or create a personal model cache. The container bootstrap is
+needed by the image used for the verified run and needs package repository access. A node-local
+Python environment is separate from the model cache. Offline mode is inherited: use it only
+when the required revisions and tokenizer are already cached.
 
-Interactively (inside `srun --pty`), the same: `uv run llm-setup start --profile profiles/a100-3x40.yaml
---foreground`; without `--foreground` the command returns once everything is ready and nothing watches
-the services afterwards.
+For startup checks, first-run cache checks and recovery, see [Operations](docs/OPERATIONS.md)
+and the parent repository's `docs/runbook-slurm.md` sections 0–0.3. Once ready:
 
-The example environment puts the Python environment and package cache on node-local scratch to avoid slow imports from shared Ceph storage. The venv is temporary and must be recreated in a new allocation. The initial embedding ID is set in `profiles/a100-3x40.yaml` and can be overridden with `EMBED_MODEL_ID`. No model weights are downloaded by validation. See `docs/OPERATIONS.md` for exact lifecycle commands.
+```sh
+srun --jobid <jobid> --overlap curl -s http://127.0.0.1:8090/info
+srun --jobid <jobid> --overlap nvidia-smi --query-gpu=index,memory.used,memory.total --format=csv
+```
+
+The default `sbatch slurm/llm-stack.sbatch` uses the distinct heavy/lite/embed profile;
+set `LLM_SETUP_PROFILE` as above for the thesis setup. Stop only the intended job with
+`scancel <jobid>`. The job's Python environment and uv package cache use temporary scratch;
+model weights stay in the cluster-configured Hugging Face cache.

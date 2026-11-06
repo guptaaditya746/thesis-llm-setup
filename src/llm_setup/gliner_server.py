@@ -69,7 +69,7 @@ def create_app(model: Any, model_name: str, revision: str | None = None, device:
 
 
 def load_model(model_name: str, revision: str | None, device: str) -> Any:
-    """Load the pinned GLiNER weights onto ``device``; offline when HF_HUB_OFFLINE=1 (as the supervisor
+    """Load the pinned GLiNER weights onto ``device``; offline when HF_HUB_OFFLINE=1 (when the operator
     sets it), so the weights and the backbone's tokenizer must already be in the Hugging Face cache."""
     from gliner import GLiNER  # imports torch: only here
 

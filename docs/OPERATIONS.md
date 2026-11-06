@@ -9,6 +9,45 @@ srun --jobid <jobid> --overlap --pty bash -l   # a shell in the same allocation
 scancel <jobid>                                # clean stop
 ```
 
+On Webis gammaweb, use the cluster's Enroot container initialization so the job inherits the
+institutional Hugging Face cache configuration. Submit the same batch script from `llm-setup/`:
+
+```sh
+LLM_SETUP_PROFILE=profiles/orch-3x40-gliner.yaml LLM_SETUP_BOOTSTRAP_COMPILER=1 \
+  sbatch --partition=gammaweb \
+  --container-image=pytorch/pytorch:2.8.0-cuda12.9-cudnn9-runtime \
+  --container-writable --container-remap-root slurm/llm-stack.sbatch
+```
+
+The cluster supplies the cache variables inside the container; do not set or replace them in the
+script or `.env`. Caches under `/var/tmp` are node-local: check the required pinned model revisions
+on the selected node before submitting, and select that node with `--nodelist` when needed. The
+container image requires enough job memory during its initial import; 8 GB was insufficient in a
+CPU-only test. The batch script's normal request is 64 GB. The runtime image lacks the C/C++ compiler
+required by Triton; the opt-in bootstrap installs it in the writable container before starting the
+stack. The bootstrap needs package repository access and does not modify the host environment.
+
+A short CPU-only preflight on a selected node can inspect the same container environment without
+reserving GPUs. Choose an Ampere node with three GPUs available for the later stack, and replace
+`<node>` with its name:
+
+```sh
+srun --partition=gammaweb --nodelist=<node> --cpus-per-task=1 --mem=16G --time=00:15:00 \
+  --container-image=pytorch/pytorch:2.8.0-cuda12.9-cudnn9-runtime \
+  --container-writable --container-remap-root --pty bash -l
+# In that container, print only the cache variables; do not print HF_TOKEN.
+for v in HF_HUB_CACHE HF_DATASETS_CACHE XDG_CACHE_HOME HF_ASSETS_CACHE HF_XET_CACHE; do
+  printf '%s=%s\n' "$v" "${!v-UNSET}"
+done
+```
+
+If the cluster settings are missing or do not point to the expected institutional locations, stop;
+do not invent replacement variables. In the environment with the installed `huggingface_hub`, print
+`huggingface_hub.constants.HF_HUB_CACHE` and `HF_HOME`, then use `snapshot_download` with
+`local_files_only=True` and the exact model revisions to look up cached snapshots. A snapshot directory
+alone does not prove all required files are present; verify file completeness and readability, including
+the GLiNER backbone tokenizer. Do not repeatedly download the large Qwen model. Node caches can differ.
+
 The job sources `.env`, installs the environment on node-local scratch, and runs
 `llm-setup start --foreground`, which:
 
@@ -108,13 +147,10 @@ With it enabled:
 - if it does not become healthy at start, the stack starts without it: it is stopped, marked failed (not
   restarted), and `gliner: start failed, continuing without it` is printed and recorded in the events.
   The evidence engine's GLiNER extractors then report the service as unavailable and the run goes on;
-- it loads offline (`HF_HUB_OFFLINE=1`, as vLLM does), so download the weights and the backbone's
-  tokenizer once, on a login node:
-
-```sh
-huggingface-cli download urchade/gliner_medium-v2.1 --revision 40ec419335d09393f298636f471328b722c6da9e
-huggingface-cli download microsoft/deberta-v3-base config.json tokenizer_config.json spm.model
-```
+- it inherits `HF_HUB_OFFLINE` from the job environment, as vLLM does. Set it to `1` only when the
+  pinned weights and backbone tokenizer are already accessible in the configured cache. If downloads are
+  required on Webis, use supported Hugging Face APIs inside the cluster-provided container environment,
+  after checking the effective cache configuration. Do not prefetch on the login node.
 
 Its API (`127.0.0.1:8090`, from the same node or through an SSH tunnel): `GET /health`,
 `GET /info` -> `{"model", "revision", "device"}`, and `POST /predict` with
@@ -127,29 +163,18 @@ GLiNER needs an estimated 1.5-2 GB on its GPU (not yet measured). A model at
 `gpu_memory_utilization: 0.92` leaves about 3 GB of a 40 GB A100, and a model restarted while GLiNER runs
 finds less free memory than at the first start.
 
-### First run
+### First run on Webis
 
-1. On a login node, download the weights and the backbone tokenizer (commands above).
-2. In the allocation, before enabling it in a profile, load it on its own on a GPU with room (or before
-   the stack starts), offline as the supervisor runs it:
-
-   ```sh
-   uv sync --python 3.13 --extra serve --extra gliner
-   HF_HUB_OFFLINE=1 CUDA_VISIBLE_DEVICES=0 uv run python -m llm_setup.gliner_server \
-     --model urchade/gliner_medium-v2.1 --revision 40ec419335d09393f298636f471328b722c6da9e --port 8090 &
-   curl -s 127.0.0.1:8090/info
-   curl -s 127.0.0.1:8090/predict -H 'Content-Type: application/json' \
-     -d '{"text": "We evaluate RAG on SQuAD.", "labels": ["method", "dataset"], "threshold": 0.5}'
-   kill %1
-   ```
-
-   An error here (missing files offline, a gliner/transformers mismatch) is cheaper than in a batch job.
-3. Uncomment the `gliner:` block in the profile, start the batch job, then on the node run
-   `uv run llm-setup doctor --profile <profile>`: `gliner health ok`, no `gliner start failed` event.
-4. Check the memory on GLiNER's GPU: `nvidia-smi --query-gpu=index,memory.used,memory.total
-   --format=csv`. Write down what GLiNER uses (`nvidia-smi` lists its process).
-5. If under about 1 GB stays free on that GPU, the model there may not come back after a watchdog restart.
-   In `orch-3x40` the orch `gpu_memory_utilization` applies to all three replicas, so do not edit
-   `orch-3x40.yaml`: copy it to `profiles/orch-3x40-gliner.yaml` with `gpu_memory_utilization: 0.88` and
-   the `gliner` block enabled, and start that (`LLM_SETUP_PROFILE=profiles/orch-3x40-gliner.yaml sbatch
-   slurm/llm-stack.sbatch`).
+1. Check the selected compute node inside a short Slurm container allocation. The cluster must provide
+   `HF_HUB_CACHE`, `HF_DATASETS_CACHE`, `XDG_CACHE_HOME`, `HF_ASSETS_CACHE` and `HF_XET_CACHE`.
+   Do not set or replace them. Inspect the Hugging Face library's effective cache and look up the pinned
+   revisions with its standard local-only API. The node-local Python virtual environment is not a model cache.
+2. Ensure the pinned Qwen and GLiNER snapshots and GLiNER's backbone tokenizer are accessible on that node.
+   If downloads are needed, use the approved container and Hugging Face APIs with the supplied cache settings;
+   never copy weights manually or create a personal cache. Do not use offline mode until the required files
+   are present. See the parent runbook section 0.1 for the pinned revisions and supported launch.
+3. Submit the Ampere job with `profiles/orch-3x40-gliner.yaml`, then check all three replicas, the gateway,
+   GLiNER `/info`, and GPU memory. GLiNER is optional to the supervisor, so a running job alone does not
+   mean GLiNER is healthy.
+4. If GPU 0 has less than about 1 GB free, stop the intended job and lower `gpu_memory_utilization` to
+   `0.88` in the GLiNER profile only; record the change. Do not edit the original `orch-3x40.yaml`.

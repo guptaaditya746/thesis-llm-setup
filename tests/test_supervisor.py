@@ -86,8 +86,21 @@ def test_vllm_environment_disables_flashinfer_sampler_without_toolkit():
     assert env["VLLM_USE_FLASHINFER_SAMPLER"] == "0"
     assert env["CUDA_VISIBLE_DEVICES"] == "2"
     assert env["HF_TOKEN"] == "hf-secret"
-    assert env["HF_HUB_OFFLINE"] == "1"
+    assert "HF_HUB_OFFLINE" not in env
     assert "LITELLM_MASTER_KEY" not in env
+
+
+def test_vllm_environment_respects_explicit_offline_mode():
+    env = _vllm_environment({"HF_HUB_OFFLINE": "1"}, {"gpu": 0}, "session-1")
+    assert env["HF_HUB_OFFLINE"] == "1"
+
+
+def test_vllm_environment_preserves_cluster_cache_configuration():
+    cache = {name: f"/cluster/{name}" for name in (
+        "HF_HUB_CACHE", "HF_DATASETS_CACHE", "XDG_CACHE_HOME", "HF_ASSETS_CACHE", "HF_XET_CACHE"
+    )}
+    env = _vllm_environment(cache, {"gpu": 0}, "session-1")
+    assert {name: env[name] for name in cache} == cache
 
 
 def test_vllm_environment_respects_explicit_flashinfer_opt_in():
