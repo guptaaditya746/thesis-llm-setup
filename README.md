@@ -17,13 +17,36 @@ flowchart LR
 ## Quick start (Webis gammaweb)
 
 ```sh
-cp .env.example .env          # once; set LITELLM_MASTER_KEY
-slurm/submit.sh               # 3 Ampere GPUs, profiles/orch-gliner.yaml, in the cluster container
+cd ~/thesis/thesis-research-agent/llm-setup
+squeue -u "$USER"                         # avoid a duplicate stack (submit.sh also refuses one)
+# Create .env from .env.example only if it does not already exist; set LITELLM_MASTER_KEY.
+slurm/submit.sh --node <node>             # thesis stack: 3 orch replicas + GLiNER on GPU 0
+# Record the job ID printed by submit.sh.
 tail -f runtime/slurm-<jobid>.out
 ```
 
-`submit.sh` refuses to submit a second stack while one runs, checks the profile before the job
-queues, and prints the commands to follow and stop it. Common variants:
+`submit.sh` does what the hand-typed `sbatch` used to: `--partition=gammaweb`, `gpu:ampere:3`,
+the cluster Enroot container (`pytorch/pytorch:2.8.0-cuda12.9-cudnn9-runtime`, writable, root
+remapped) and the compiler bootstrap, with `profiles/orch-gliner.yaml` (formerly
+`orch-3x40-gliner.yaml`). It also refuses a second stack, checks the profile before the job
+queues, and prints the commands to follow and stop it.
+
+**Webis rules (the model cache):**
+
+- Stay on Ampere (`gpu:ampere`); do not switch to Hopper.
+- Pick the node with `--node <node>` where the pinned revisions are known to be cached; caches are
+  node-local. Check the container's cache environment on that node first
+  ([docs/OPERATIONS.md](docs/OPERATIONS.md#model-cache-webis) has the command).
+- The institution provides `HF_HUB_CACHE`, `HF_DATASETS_CACHE` and `XDG_CACHE_HOME` inside the
+  container. Never overwrite those variables, copy model weights into `/tmp`, or create a personal
+  model cache. Nothing in this repository sets them; the model processes inherit them unchanged.
+- The container bootstrap (a C compiler for Triton) is needed by this image and needs package
+  repository access. The node-local Python environment (`.env`, `LLM_SETUP_LOCAL_ROOT`) is
+  separate from the model cache.
+- Offline mode is inherited: set `HF_HUB_OFFLINE=1` only when the required revisions and GLiNER's
+  backbone tokenizer are already cached.
+
+Common variants:
 
 ```sh
 slurm/submit.sh --gpus 1 --profile profiles/orch.yaml      # one orch replica on one GPU
