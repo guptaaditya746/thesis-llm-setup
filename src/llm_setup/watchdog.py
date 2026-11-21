@@ -14,11 +14,12 @@ from __future__ import annotations
 import signal
 import threading
 import time
-from pathlib import Path
 
 import httpx
 
-from .supervisor import Say, Service, Session, clock, record_event, terminate
+from .logs import last_line
+from .runtime import Runtime, record_event
+from .supervisor import Say, Service, Session, clock, terminate
 
 MODEL_RESTARTS_PER_HOUR = 3
 SERVICE_RESTARTS_PER_HOUR = 20
@@ -27,7 +28,7 @@ UNHEALTHY_AFTER = 6          # failed health checks in a row (one a check interv
 
 class Watchdog:
     def __init__(self, session: Session, say: Say, status_url: str, check_s: float = 10.0,
-                 summary_s: float = 300.0, root: Path = Path("runtime"),
+                 summary_s: float = 300.0, runtime: Runtime | None = None,
                  backoff_s: tuple[float, float] = (30.0, 5.0)) -> None:
         """``backoff_s``: the first restart delay for a model and for the gateway/status API; it doubles
         with each restart in the last hour (at most 300 s and 60 s)."""
@@ -37,7 +38,7 @@ class Watchdog:
         self.status_url = status_url
         self.check_s = check_s
         self.summary_s = summary_s
-        self.root = root
+        self.runtime = runtime or Runtime()
         self.stop = threading.Event()
         self.reason = "stopped"
         self.failures: dict[str, int] = {}
@@ -74,9 +75,7 @@ class Watchdog:
                 self.say(self.summary())
         self.event("session", "stopping", self.reason)
         stopped = terminate(self.session, say=self.say)
-        current = self.root / "current"
-        if current.exists() and current.read_text(encoding="utf-8").strip() == self.session.id:
-            current.unlink()
+        self.runtime.clear_current(only=self.session.id)
         self.event("session", "stopped", ", ".join(stopped) or "nothing was running")
         failed = [name for name, item in self.session.services.items() if item.state == "failed"]
         return 1 if failed else 0
@@ -98,7 +97,7 @@ class Watchdog:
                 return
             code = service.exited()
             if code is not None:
-                self.event(service.name, "exited again", f"status {code}; last log line: {_last_line(service)}")
+                self.event(service.name, "exited again", f"status {code}; last log line: {last_line(service.log)}")
                 self._schedule_restart(service)
             elif service.healthy():
                 service.state = "ready"
@@ -107,7 +106,7 @@ class Watchdog:
             return
         code = service.exited()
         if code is not None:
-            self.event(service.name, "exited", f"status {code}; last log line: {_last_line(service)}")
+            self.event(service.name, "exited", f"status {code}; last log line: {last_line(service.log)}")
             self._schedule_restart(service)
             return
         if service.healthy():
@@ -123,7 +122,7 @@ class Watchdog:
                        f"process alive for {int(UNHEALTHY_AFTER * self.check_s)} s without an answer")
 
     def _schedule_restart(self, service: Service) -> None:
-        model = service.name not in {"gateway", "status"}
+        model = service.kind in {"model", "gliner"}
         limit = MODEL_RESTARTS_PER_HOUR if model else SERVICE_RESTARTS_PER_HOUR
         recent = [moment for moment in service.restarts if time.time() - moment < 3600]
         if len(recent) >= limit:
@@ -138,10 +137,9 @@ class Watchdog:
         self.event(service.name, "restarting", f"in {int(delay)} s")
 
     def _stopped_elsewhere(self) -> bool:
-        current = self.root / "current"
         try:
-            return current.read_text(encoding="utf-8").strip() != self.session.id
-        except OSError:
+            return self.runtime.current_id() != self.session.id
+        except (OSError, RuntimeError):
             return True
 
     def summary(self) -> str:
@@ -160,9 +158,3 @@ class Watchdog:
             line += " · status API not answering"
         return line
 
-
-def _last_line(service: Service) -> str:
-    from .phases import log_lines
-
-    lines = log_lines(service.log)
-    return lines[-1][:160] if lines else "empty log"

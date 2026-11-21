@@ -1,11 +1,11 @@
-"""What a starting service is doing, read from the end of its log."""
+"""Reading service logs: the last lines, and what a starting service is doing."""
 
 from __future__ import annotations
 
 import re
 from pathlib import Path
 
-# Checked against the newest log line first; the first pattern that matches a line names the phase.
+# Checked against the newest log line first; the first pattern that matches names the phase.
 # vLLM and LiteLLM wording; a line that matches nothing is shown as it is.
 PHASES: tuple[tuple[re.Pattern[str], str], ...] = tuple((re.compile(pattern, re.IGNORECASE), name) for pattern, name in (
     (r"Application startup complete|Uvicorn running on|Starting vLLM API server", "starting the API"),
@@ -27,8 +27,7 @@ def log_lines(path: Path, limit_bytes: int = 64_000) -> list[str]:
     try:
         with path.open("rb") as handle:
             handle.seek(0, 2)
-            size = handle.tell()
-            handle.seek(max(0, size - limit_bytes))
+            handle.seek(max(0, handle.tell() - limit_bytes))
             text = handle.read().decode("utf-8", errors="replace")
     except OSError:
         return []
@@ -48,3 +47,8 @@ def current_phase(path: Path) -> str:
 
 def tail(path: Path, count: int = 20) -> str:
     return "\n".join(log_lines(path)[-count:])
+
+
+def last_line(path: Path) -> str:
+    lines = log_lines(path)
+    return lines[-1][:160] if lines else "empty log"

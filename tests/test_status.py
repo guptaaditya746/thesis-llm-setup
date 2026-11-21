@@ -1,6 +1,9 @@
-from llm_setup.history import History
-from llm_setup.profile import load_profile
-from llm_setup.status import StatusMonitor, classify
+from pathlib import Path
+
+from llm_setup.profile import load_profile, parse_profile, read_profile
+from llm_setup.status import History, StatusMonitor, classify
+
+PROFILES = Path(__file__).resolve().parents[1] / "profiles"
 
 
 def test_status_classification_and_recovery():
@@ -39,16 +42,24 @@ def test_status_polls_fake_http_backends(tmp_path):
     for thread in threads:
         thread.start()
     try:
-        profile = load_profile("profiles/a100-3x40.yaml")
-        for item, server in zip(profile["models"].values(), servers):
+        data = read_profile(PROFILES / "heavy-lite-embed.yaml")
+        for item, server in zip(data["models"].values(), servers):
             item["port"] = server.server_address[1]
+        profile = parse_profile(data)
         monitor = StatusMonitor(profile, History(tmp_path / "status.sqlite3"))
         report = asyncio.run(monitor.poll_once())
         assert report["overall"] == "healthy"
         assert all(item["running"] == 1 for item in report["models"].values())
+        assert set(report["models"]) == {"heavy-model", "lite-model", "qwen-embed"}
+        assert set(report) == {"overall", "updatedAt", "models"}
     finally:
         for server in servers:
             server.shutdown()
             server.server_close()
         for thread in threads:
             thread.join(timeout=2)
+
+
+def test_replicas_are_reported_by_alias_and_port():
+    monitor = StatusMonitor(load_profile(PROFILES / "orch.yaml", 3), History(":memory:"))
+    assert monitor.targets == {f"orch-model@{port}": f"http://127.0.0.1:{port}" for port in (8001, 8002, 8003)}

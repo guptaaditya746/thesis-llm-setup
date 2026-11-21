@@ -1,125 +1,104 @@
 # Operations
 
-## Start as a batch job (recommended)
+## Starting
+
+From the login node, in this repository:
 
 ```sh
-sbatch slurm/llm-stack.sbatch                  # resources in the script's #SBATCH lines, or on the command line
-tail -f runtime/slurm-<jobid>.out              # progress, events, summaries
-srun --jobid <jobid> --overlap --pty bash -l   # a shell in the same allocation
-scancel <jobid>                                # clean stop
+squeue -u "$USER"                  # submit.sh also refuses a second llm-stack job
+slurm/submit.sh [--gpus N] [--profile FILE] [--node NAME] [--time T]
+tail -f runtime/slurm-<jobid>.out
 ```
 
-On Webis gammaweb, use the cluster's Enroot container initialization so the job inherits the
-institutional Hugging Face cache configuration. Submit the same batch script from `llm-setup/`:
+`submit.sh` checks `.env` and the profile, then submits `slurm/job.sh` with
+`--partition=gammaweb --gres=gpu:ampere:N` and the cluster container
+(`pytorch/pytorch:2.8.0-cuda12.9-cudnn9-runtime`, writable, root remapped). `--native` runs without
+the container; `LLM_SETUP_PARTITION`, `LLM_SETUP_GPU_TYPE` and `LLM_SETUP_CONTAINER` change the
+defaults; arguments after `--` go to `sbatch`. Stay on Ampere: the profiles are sized for A100 40 GB.
 
-```sh
-LLM_SETUP_PROFILE=profiles/orch-3x40-gliner.yaml LLM_SETUP_BOOTSTRAP_COMPILER=1 \
-  sbatch --partition=gammaweb \
-  --container-image=pytorch/pytorch:2.8.0-cuda12.9-cudnn9-runtime \
-  --container-writable --container-remap-root slurm/llm-stack.sbatch
-```
+**Inside a job you already hold** (for example `srun --gres=gpu:ampere:3 ... --pty bash`):
+`slurm/submit.sh --job <jobid>` runs the same `job.sh` as an extra step (`srun --overlap` with the
+job's GPUs and `--mem=0`), detached from the terminal, logging to `runtime/slurm-<jobid>.out`.
+Stop it with `scancel <jobid>.<step>` (`squeue -s -j <jobid>` lists steps) or by ending the job.
 
-The cluster supplies the cache variables inside the container; do not set or replace them in the
-script or `.env`. Caches under `/var/tmp` are node-local: check the required pinned model revisions
-on the selected node before submitting, and select that node with `--nodelist` when needed. The
-container image requires enough job memory during its initial import; 8 GB was insufficient in a
-CPU-only test. The batch script's normal request is 64 GB. The runtime image lacks the C/C++ compiler
-required by Triton; the opt-in bootstrap installs it in the writable container before starting the
-stack. The bootstrap needs package repository access and does not modify the host environment.
+## What the job does
 
-### Inside a job you already hold
+`slurm/job.sh` sources `.env`, installs Python 3.13 and the serving environment on node-local
+scratch (`LLM_SETUP_LOCAL_ROOT`; importing torch and vLLM from the shared filesystem can stall),
+adds the extras the profile needs (GLiNER), installs a C compiler for Triton in the container if
+missing, gives vLLM a per-job rendezvous port block, then runs `llm-setup start --foreground`, which:
 
-`slurm/start-in-job.sh <jobid>` runs the same batch script as an extra step of an existing allocation
-(`srun --jobid <jobid> --overlap --gres=gpu:ampere:3 --mem=0` with the same container flags), detached from
-the terminal, logging to `runtime/slurm-<jobid>.out`. Two details it handles, which a hand-typed `srun`
-gets wrong: the container starts in the image's own directory, so the script is called by its absolute
-path after `cd` into this repository (otherwise `bash: slurm/llm-stack.sbatch: No such file or directory`,
-exit 127); and an overlapping step sees no GPU unless it asks for the job's GPUs with `--gres`. Set
-`LLM_SETUP_CONTAINER=none` on a node with a native toolchain. Stop it with `scancel <jobid>.<step>`
-(`squeue -s -j <jobid>` lists steps) or by ending the job.
+- starts every model replica **in parallel**, then GLiNER, then LiteLLM, then the status API, each
+  only after the previous ones answer their health check;
+- prints every 15 s what each model is doing (downloading, loading weights NN%, sizing the KV cache,
+  compiling, capturing CUDA graphs) and `ready after M:SS` for each;
+- on a failed start prints the end of the failing service's log with a hint and stops the rest
+  (a GLiNER failure is the exception: the stack runs without it);
+- then watches: a crashed service is restarted (the gateway and status API after 5 s, a model
+  after 30 s, doubling each time, a model at most 3 times an hour); a live service that stops
+  answering its health check for a minute is reported, and again when it answers;
+- prints a summary every 5 minutes;
+- on SIGTERM (`scancel`, or `--signal=B:TERM@180` before the time limit) or Ctrl-C stops every
+  process of the session (SIGTERM to each process group, SIGKILL after 30 s).
 
-A short CPU-only preflight on a selected node can inspect the same container environment without
-reserving GPUs. Choose an Ampere node with three GPUs available for the later stack, and replace
-`<node>` with its name:
+Every event goes to `runtime/<session>/events.jsonl` (`llm-setup events`, `GET :8010/v1/events`).
+Only processes carrying the session's marker are ever signalled.
+
+## Model cache (Webis)
+
+The cluster container supplies `HF_HUB_CACHE`, `HF_DATASETS_CACHE`, `XDG_CACHE_HOME`,
+`HF_ASSETS_CACHE` and `HF_XET_CACHE`. Never set or replace them, copy weights to `/tmp`, or create a
+personal cache. Caches under `/var/tmp` are node-local: check that the pinned revisions are on the
+node before submitting, and choose it with `--node`. A short CPU-only check of a node:
 
 ```sh
 srun --partition=gammaweb --nodelist=<node> --cpus-per-task=1 --mem=16G --time=00:15:00 \
   --container-image=pytorch/pytorch:2.8.0-cuda12.9-cudnn9-runtime \
   --container-writable --container-remap-root --pty bash -l
-# In that container, print only the cache variables; do not print HF_TOKEN.
 for v in HF_HUB_CACHE HF_DATASETS_CACHE XDG_CACHE_HOME HF_ASSETS_CACHE HF_XET_CACHE; do
-  printf '%s=%s\n' "$v" "${!v-UNSET}"
+  printf '%s=%s\n' "$v" "${!v-UNSET}"        # never print HF_TOKEN
 done
 ```
 
-If the cluster settings are missing or do not point to the expected institutional locations, stop;
-do not invent replacement variables. In the environment with the installed `huggingface_hub`, print
-`huggingface_hub.constants.HF_HUB_CACHE` and `HF_HOME`, then use `snapshot_download` with
-`local_files_only=True` and the exact model revisions to look up cached snapshots. A snapshot directory
-alone does not prove all required files are present; verify file completeness and readability, including
-the GLiNER backbone tokenizer. Do not repeatedly download the large Qwen model. Node caches can differ.
+If the variables are missing or point somewhere unexpected, stop. Look snapshots up with
+`huggingface_hub.snapshot_download(..., revision=..., local_files_only=True)`; a snapshot directory
+alone does not prove every file is there. Do not download the large Qwen model repeatedly.
+`HF_HUB_OFFLINE` is inherited: set it to 1 only when the pinned revisions and GLiNER's backbone
+tokenizer are already cached. The container needs more than 8 GB of job memory during its first
+import (the job asks for 64 GB) and package repository access for the compiler bootstrap.
 
-The job sources `.env`, installs the environment on node-local scratch, and runs
-`llm-setup start --foreground`, which:
+## GLiNER
 
-- starts Embed, Heavy and Lite **in parallel** (one GPU each), then LiteLLM, then the status API, each
-  only after the previous ones answer their health check;
-- prints every 15 s what each model is doing, read from its log (downloading, loading weights NN%,
-  sizing the KV cache, compiling, capturing CUDA graphs), and `ready after M:SS` for each;
-- on a failed start, prints the end of the failing service's log with a hint, and stops the rest;
-- then watches: a service whose process exits is restarted (LiteLLM and the status API after 5 s,
-  a model after 30 s, doubling each time, a model at most 3 times an hour); a live service that stops
-  answering its health check for a minute is reported, and again when it answers;
-- prints a summary every 5 minutes (each service, restarts, running/waiting per model);
-- on SIGTERM (`scancel`, `--signal=B:TERM@180` before the time limit) or Ctrl-C stops every process of the
-  session (SIGTERM to each process group, SIGKILL after 30 s) and clears `runtime/current`.
+An optional named-entity service for the thesis evidence engine (`src/llm_setup/gliner_server.py`),
+on in `profiles/orch-gliner.yaml`. It starts after the models (vLLM sizes its memory from what is
+free) and shares GPU 0; it needs an estimated 1.5-2 GB, and a model at
+`gpu_memory_utilization: 0.92` leaves about 3 GB of an A100 40 GB. If GPU 0 has under ~1 GB free
+after start, lower orch's fraction to 0.88 in `orch-gliner.yaml`. If it fails to start, the stack
+runs without it (`gliner: start failed, continuing without it`); the watchdog restarts it like a
+model once it has been ready.
 
-Every event goes to `runtime/<session>/events.jsonl`: `llm-setup events` prints them, and the status API
-serves them at `/v1/events`.
+API on `127.0.0.1:${GLINER_PORT:-8090}`, which the evidence engine reads from `GLINER_URL`:
 
-## Interactive allocation
+- `GET /health`; `GET /info` -> `{"model", "revision", "device", "max_chars"}`
+- `POST /predict` `{"text": str, "labels": [str], "threshold": 0.5}` ->
+  `{"entities": [{"start", "end", "text", "label", "score"}]}`, character offsets into `text`.
+  A text longer than `max_chars` gets HTTP 413: GLiNER medium reads about 384 words and would drop
+  the rest silently, so callers send smaller chunks.
 
-```sh
-srun --gres=gpu:ampere:3 --cpus-per-task=16 --mem=64g --time=48:00:00 --pty bash -l
-```
-
-Closing this terminal ends the allocation and every model in it; prefer the batch job for long runs.
-
-Keep the Python environment, managed Python, and uv cache on node-local scratch. The example `.env` sets these paths using `SLURM_TMPDIR`, or `/tmp` when that variable is unavailable. After sourcing `.env`, install the local Python and serving dependencies:
-
-```sh
-mkdir -p "$LLM_SETUP_LOCAL_ROOT"
-uv python install 3.13
-uv sync --python 3.13 --extra serve
-```
-
-This avoids importing Torch and vLLM from the shared Ceph filesystem, where CLI startup can block on file reads. Model weights remain in the Hugging Face cache and are not copied by setup. Set `EMBED_MODEL_ID` only if selecting a different embedding model. Then start with `uv run llm-setup start --profile profiles/a100-3x40.yaml`. Startup order is Embed vLLM, Heavy vLLM, Lite vLLM, LiteLLM, then status API. Each backend must pass `/health` before its dependent service starts. All listeners bind to `127.0.0.1`.
-
-Useful commands:
-
-```sh
-uv run llm-setup doctor --profile profiles/a100-3x40.yaml   # every check in order; names the first problem
-uv run llm-setup events                                      # starts, exits, restarts, stops
-uv run llm-setup verify --profile profiles/a100-3x40.yaml
-uv run llm-setup smoke --profile profiles/a100-3x40.yaml
-uv run llm-setup status
-uv run llm-setup logs --service heavy
-uv run llm-setup stop
-```
-
-`start` refuses to run while a recorded session still has live processes, and clears a recorded
-session none of whose processes is alive (an allocation that ended without `stop`). It also refuses when
-a profile port is already in use. Session process records, copied profile, generated gateway configuration, logs, and SQLite history live in `runtime/<session-id>/`. Stop before leaving the allocation. An SSH tunnel from a trusted workstation can forward the local gateway and status ports with `ssh -L 4000:127.0.0.1:4000 -L 8010:127.0.0.1:8010 <host>`; model ports remain local to the allocation.
+First run on a node: check the cache variables (above), make sure the pinned Qwen and GLiNER
+snapshots and GLiNER's backbone tokenizer (`microsoft/deberta-v3-base`) are there, submit, then
+check the replicas, gateway, `curl :8090/info` and `nvidia-smi` memory (`llm-setup doctor` does
+all of it). A running job alone does not mean GLiNER is healthy.
 
 ## Load test
 
-Measure before changing concurrency limits, context or memory fractions. Run inside the allocation while nothing else uses the models, one role at a time, with prompts close to real sizes (the harness sends roughly 4k to 20k input tokens):
+Measure before changing concurrency limits, context or memory fractions. Inside the allocation,
+while nothing else uses the models, one replica at a time, with prompts close to real sizes:
 
 ```sh
 for c in 1 2 4 8; do
-  vllm bench serve --backend openai-chat --base-url http://127.0.0.1:8002 \
-    --endpoint /v1/chat/completions \
-    --model Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 --served-model-name heavy-model \
+  vllm bench serve --backend openai-chat --base-url http://127.0.0.1:8001 \
+    --endpoint /v1/chat/completions --model Qwen/Qwen3.8-27B-FP8 --served-model-name orch-model \
     --dataset-name random --random-input-len 12000 --random-output-len 800 \
     --num-prompts $((c*4)) --max-concurrency $c 2>&1 \
     | grep -E "Mean TTFT|Median TTFT|P99 TTFT|Mean TPOT|Request throughput"
@@ -127,65 +106,13 @@ done
 curl -s http://127.0.0.1:8010/v1/status | python3 -m json.tool
 ```
 
-For Lite use port 8003, `ibm-granite/granite-4.1-8b` and `lite-model`. Record time to first token, time per output token and throughput per concurrency level, plus the `preemptions` and `kvCache` values from `/v1/status`. Set `max_num_active_seqs` at the last level where time to first token stays acceptable and preemptions stay at zero.
+Record time to first token, time per output token and throughput per level, plus `preemptions`
+and `kvCache`. Set `max_num_active_seqs` at the last level where time to first token stays
+acceptable and preemptions stay at zero.
 
-## GLiNER
+## Without Slurm's batch job
 
-An optional named-entity service for the thesis evidence engine (`src/llm_setup/gliner_server.py`). It
-is off in every profile; a profile turns it on with a `gliner` section:
-
-```yaml
-gliner:
-  enabled: true
-  gpu: 0                                   # a GPU that already serves a model: it shares it
-  port: ${GLINER_PORT:-8090}               # loopback only; GLINER_PORT moves it off a port another user holds
-  model: urchade/gliner_medium-v2.1        # the default
-  revision: 40ec419335d09393f298636f471328b722c6da9e   # pinned; the default for the default model
-  max_chars: 1500                          # longer /predict texts get HTTP 413, never a silent cut
-```
-
-`profiles/orch-3x40.yaml` (the thesis stack) and `profiles/agent-3x40.yaml` carry this block commented out.
-With it enabled:
-
-- the batch job runs `llm-setup profile extras --profile <profile>` after the usual install and, since it
-  prints `gliner`, installs the `gliner` extra too (`uv sync --python 3.13 --extra serve --extra gliner`).
-  GLiNER uses the torch that vLLM pins (`serve`), so there is no separate PyTorch CUDA index; an install of
-  `--extra gliner` alone gets torch from PyPI, whose Linux wheels carry their own CUDA libraries;
-- `start` launches it after the models answer `/health` (vLLM sizes its memory from what is free when it
-  starts) and before the gateway, as service `gliner` with its own log (`llm-setup logs --service gliner`);
-  the watchdog restarts it like a model once it has been ready; `doctor` checks its GPU, port, weights
-  and `/health`, and `llm-setup status` shows a `gliner` row;
-- if it does not become healthy at start, the stack starts without it: it is stopped, marked failed (not
-  restarted), and `gliner: start failed, continuing without it` is printed and recorded in the events.
-  The evidence engine's GLiNER extractors then report the service as unavailable and the run goes on;
-- it inherits `HF_HUB_OFFLINE` from the job environment, as vLLM does. Set it to `1` only when the
-  pinned weights and backbone tokenizer are already accessible in the configured cache. If downloads are
-  required on Webis, use supported Hugging Face APIs inside the cluster-provided container environment,
-  after checking the effective cache configuration. Do not prefetch on the login node.
-
-Its API (`127.0.0.1:8090` unless `GLINER_PORT` moved it, from the same node or through an SSH tunnel): `GET /health`,
-`GET /info` -> `{"model", "revision", "device"}`, and `POST /predict` with
-`{"text": str, "labels": [str], "threshold": 0.5}` -> `{"entities": [{"start", "end", "text", "label",
-"score"}]}`, character offsets into `text`. A text longer than `max_chars` (reported by `/info`) gets
-HTTP 413: GLiNER medium reads about 384 words and would drop the rest without saying so. The evidence engine reads it from `GLINER_URL`
-(`export GLINER_URL=http://127.0.0.1:${GLINER_PORT:-8090}`).
-
-GLiNER needs an estimated 1.5-2 GB on its GPU (not yet measured). A model at
-`gpu_memory_utilization: 0.92` leaves about 3 GB of a 40 GB A100, and a model restarted while GLiNER runs
-finds less free memory than at the first start.
-
-### First run on Webis
-
-1. Check the selected compute node inside a short Slurm container allocation. The cluster must provide
-   `HF_HUB_CACHE`, `HF_DATASETS_CACHE`, `XDG_CACHE_HOME`, `HF_ASSETS_CACHE` and `HF_XET_CACHE`.
-   Do not set or replace them. Inspect the Hugging Face library's effective cache and look up the pinned
-   revisions with its standard local-only API. The node-local Python virtual environment is not a model cache.
-2. Ensure the pinned Qwen and GLiNER snapshots and GLiNER's backbone tokenizer are accessible on that node.
-   If downloads are needed, use the approved container and Hugging Face APIs with the supplied cache settings;
-   never copy weights manually or create a personal cache. Do not use offline mode until the required files
-   are present. See the parent runbook section 0.1 for the pinned revisions and supported launch.
-3. Submit the Ampere job with `profiles/orch-3x40-gliner.yaml`, then check all three replicas, the gateway,
-   GLiNER `/info`, and GPU memory. GLiNER is optional to the supervisor, so a running job alone does not
-   mean GLiNER is healthy.
-4. If GPU 0 has less than about 1 GB free, stop the intended job and lower `gpu_memory_utilization` to
-   `0.88` in the GLiNER profile only; record the change. Do not edit the original `orch-3x40.yaml`.
+In an interactive allocation, after `set -a; source .env; set +a` and
+`uv sync --python 3.13 --extra serve`: `uv run llm-setup start --profile <file>` starts the stack
+and returns; `uv run llm-setup stop` stops it. Closing the terminal ends the allocation and every
+model in it, so prefer `submit.sh` for anything long.

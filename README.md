@@ -1,69 +1,97 @@
-# Local LLM serving
+# Local LLM serving on Slurm
 
-This repository runs two chat models and one embedding model on a three-GPU Slurm allocation. vLLM serves each backend on loopback; LiteLLM is the only OpenAI-compatible gateway. The status API polls backend health and metrics and stores one day of compact samples in SQLite.
+Serves LLMs on a Slurm GPU allocation. vLLM runs each model on its own GPU, bound to 127.0.0.1;
+LiteLLM is the single OpenAI-compatible gateway; a status API reports each model's load. A
+supervisor starts everything in order, restarts what crashes, and stops it all cleanly on `scancel`.
 
 ```mermaid
 flowchart LR
-  C[Consumer] --> L[LiteLLM :4000]
-  L --> H[heavy-model / vLLM :8002 / GPU 0]
-  L --> S[lite-model / vLLM :8003 / GPU 1]
-  L --> E[qwen-embed / vLLM :8001 / GPU 2]
-  A[Status API :8010] --> H
-  A --> S
-  A --> E
-  A --> D[(runtime SQLite)]
+  C[Client] --> L[LiteLLM :4000]
+  L --> R1[orch / vLLM :8001 / GPU 0]
+  L --> R2[orch-2 / vLLM :8002 / GPU 1]
+  L --> R3[orch-3 / vLLM :8003 / GPU 2]
+  G[GLiNER :8090 / GPU 0]
+  A[Status API :8010] --> R1 & R2 & R3
 ```
 
-Heavy (`heavy-model`) handles quality schema inference, evidence review, and answer verification. Lite (`lite-model`) handles structured and EDC extraction, mapping, planning, and MCP control. Embed (`qwen-embed`) accepts embedding requests only.
-
-## Webis quick start: three Ampere GPUs and GLiNER
-
-For the thesis stack use `profiles/orch-3x40-gliner.yaml`: three Qwen replicas behind
-`orch-model` and GLiNER on GPU 0. Each service listens on loopback. Check for existing
-jobs first and use the cluster-provided Enroot environment:
+## Quick start (Webis gammaweb)
 
 ```sh
-cd ~/thesis/thesis-research-agent/llm-setup
-squeue -u "$USER"                         # avoid a duplicate stack
-# Create .env from .env.example only if it does not already exist; set LITELLM_MASTER_KEY.
-LLM_SETUP_PROFILE=profiles/orch-3x40-gliner.yaml LLM_SETUP_BOOTSTRAP_COMPILER=1 \
-  sbatch --partition=gammaweb --container-image=pytorch/pytorch:2.8.0-cuda12.9-cudnn9-runtime \
-  --container-writable --container-remap-root slurm/llm-stack.sbatch
-# Record the job ID printed by sbatch.
+cp .env.example .env          # once; set LITELLM_MASTER_KEY
+slurm/submit.sh               # 3 Ampere GPUs, profiles/orch-gliner.yaml, in the cluster container
 tail -f runtime/slurm-<jobid>.out
 ```
 
-The script requests `gpu:ampere:3`; do not switch to Hopper. Select a node with
-`--nodelist=<node>` when the pinned revisions are known to be available there. Check the
-container's cache environment on the selected compute node first: the institution provides
-`HF_HUB_CACHE`, `HF_DATASETS_CACHE` and `XDG_CACHE_HOME`. Never overwrite those variables,
-copy model weights into `/tmp`, or create a personal model cache. The container bootstrap is
-needed by the image used for the verified run and needs package repository access. A node-local
-Python environment is separate from the model cache. Offline mode is inherited: use it only
-when the required revisions and tokenizer are already cached.
-
-Already holding a GPU job (for example an interactive `srun --gres=gpu:ampere:3 ... --pty bash`)?
-Start the stack inside it instead of submitting a second job:
+`submit.sh` refuses to submit a second stack while one runs, checks the profile before the job
+queues, and prints the commands to follow and stop it. Common variants:
 
 ```sh
-LLM_SETUP_PROFILE=profiles/orch-3x40-gliner.yaml slurm/start-in-job.sh <jobid>
-tail -f runtime/slurm-<jobid>.out
+slurm/submit.sh --gpus 1 --profile profiles/orch.yaml      # one orch replica on one GPU
+slurm/submit.sh --node gammaweb08                          # where the pinned weights are cached
+slurm/submit.sh --job <jobid>                              # inside a GPU job you already hold
+GLINER_PORT=8091 slurm/submit.sh                           # another user's server holds 8090
+slurm/submit.sh --help
 ```
 
-Gammaweb nodes are shared: another user's server may already hold one of our ports (seen: a foreign
-vLLM on 8090, GLiNER's default). `start` then stops with `ports already in use`. Do not stop their
-process; move ours, e.g. `GLINER_PORT=8091` before the command above, and use that port in
-`GLINER_URL`. Symptoms and fixes: [Debugging](docs/DEBUGGING.md).
+Stop with `scancel <jobid>` (the supervisor gets SIGTERM and stops every service).
 
-For startup checks, first-run cache checks and recovery, see [Operations](docs/OPERATIONS.md)
-and the parent repository's `docs/runbook-slurm.md` sections 0–0.3. Once ready:
+## Profiles
+
+| Profile | Serves | GPUs |
+| --- | --- | --- |
+| `profiles/orch.yaml` | `orch-model`, one replica per GPU | 1 or more |
+| `profiles/orch-gliner.yaml` | the same, plus GLiNER on GPU 0 (the thesis stack, default) | 1 or more |
+| `profiles/heavy-lite-embed.yaml` | `heavy-model`, `lite-model`, `qwen-embed`, one GPU each | 3 |
+
+`gpus: all` in a profile means one replica on every GPU of the allocation, so `--gpus` alone
+decides between one and three replicas. Format and capacity notes: [docs/PROFILES.md](docs/PROFILES.md).
+
+## Using the stack
+
+From the compute node (`srun --jobid <jobid> --overlap --pty bash -l`) or through an SSH tunnel
+(`ssh -L 4000:127.0.0.1:4000 -L 8010:127.0.0.1:8010 <node>`):
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://127.0.0.1:4000/v1", api_key="<LITELLM_MASTER_KEY>")
+client.chat.completions.create(model="orch-model", messages=[{"role": "user", "content": "Hi"}])
+```
+
+- Call the gateway (`:4000/v1`) only, never a vLLM port. With several replicas, `orch-model` goes to
+  the least busy one and `orch-model-1`, `-2`, `-3` pin one.
+- `GET :8010/v1/status` gives `overall` and each model's `state` (healthy, busy, saturated,
+  recovering, unavailable), `running`, `waiting` and `kvCache`; `GET :8010/v1/events` the supervisor's events.
+- GLiNER: `GET :8090/info`, `POST :8090/predict` (see [docs/OPERATIONS.md](docs/OPERATIONS.md#gliner)).
+
+## Commands on the compute node
 
 ```sh
-srun --jobid <jobid> --overlap curl -s http://127.0.0.1:${GLINER_PORT:-8090}/info
-srun --jobid <jobid> --overlap nvidia-smi --query-gpu=index,memory.used,memory.total --format=csv
+uv run llm-setup doctor            # every check in order; names the first problem (--smoke: one request per model)
+uv run llm-setup status            # each replica's state, load and KV cache
+uv run llm-setup events            # starts, exits, restarts, stops
+uv run llm-setup logs orch-2       # a service's log (also after a failed start)
+uv run llm-setup stop              # stop the session from another shell
+uv run llm-setup profile show --profile profiles/orch.yaml --gpus 3
 ```
 
-The default `sbatch slurm/llm-stack.sbatch` uses the distinct heavy/lite/embed profile;
-set `LLM_SETUP_PROFILE` as above for the thesis setup. Stop only the intended job with
-`scancel <jobid>`. The job's Python environment and uv package cache use temporary scratch;
-model weights stay in the cluster-configured Hugging Face cache.
+## Layout
+
+```
+slurm/submit.sh        login node: submit a job, or start inside one (--job)
+slurm/job.sh           inside the allocation: install on node-local scratch, run the supervisor
+profiles/              what runs where
+src/llm_setup/
+  cli.py               the llm-setup command
+  profile.py           profile loading (env vars, extends, gpus: all) and validation
+  supervisor.py        start order, health waits, clean stop
+  watchdog.py          restarts with back-off, health reports, SIGTERM handling
+  vllm.py, gateway.py  vLLM command/environment and checks; the LiteLLM config
+  runtime.py           runtime/<session>/: logs, events, process records
+  process.py           session-owned processes only: marker, signals, GPU mapping
+  status.py, metrics.py  the status API
+  doctor.py            doctor and smoke checks
+  gliner_server.py     the optional GLiNER HTTP service
+docs/                  OPERATIONS (running it), PROFILES (configuring it), DEBUGGING (fixing it)
+```
+
+Tests run without a GPU: `uv run --extra dev pytest -q` and `uv run --extra dev ruff check .`.

@@ -1,3 +1,0 @@
-# Not used at runtime: supervisor.render_litellm generates the real config per
-# session from the selected profile (stable aliases, retry policy, no fallbacks).
-model_list: []

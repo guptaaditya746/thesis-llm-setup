@@ -1,0 +1,11 @@
+# The thesis stack: profiles/orch.yaml plus GLiNER (named entities for the evidence engine) on GPU 0,
+# next to the first orch replica. GLiNER starts after the models; if it fails, the stack runs without it.
+# If GPU 0 has under ~1 GB free after start, set orch's gpu_memory_utilization to 0.88 here.
+extends: orch.yaml
+name: orch-gliner
+gliner:
+  gpu: 0
+  port: ${GLINER_PORT:-8090}          # move it when another user's server holds 8090 (docs/DEBUGGING.md)
+  model: urchade/gliner_medium-v2.1
+  revision: 40ec419335d09393f298636f471328b722c6da9e
+  max_chars: 1500                     # longer /predict texts get HTTP 413, never a silent cut

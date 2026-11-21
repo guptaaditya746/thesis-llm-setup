@@ -12,20 +12,27 @@ from fastapi.testclient import TestClient
 
 from llm_setup.profile import (
     GLINER_DEFAULTS,
+    Gliner,
     ProfileError,
-    gliner_settings,
     load_profile,
-    validate_profile,
+    parse_profile,
+    read_profile,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
+PROFILES = ROOT / "profiles"
 
 
-def agent_profile(**gliner):
-    data = load_profile(ROOT / "profiles" / "agent-3x40.yaml")
+def orch_data(gpus: int = 3, **gliner) -> dict:
+    data = read_profile(PROFILES / "orch.yaml")
+    data["models"]["orch"]["gpus"] = list(range(gpus))
     if gliner:
         data["gliner"] = gliner
     return data
+
+
+def orch_profile(gpus: int = 3, **gliner):
+    return parse_profile(orch_data(gpus, **gliner))
 
 
 class FakeModel:
@@ -55,80 +62,52 @@ def client(model=None):
 
 # Profile -------------------------------------------------------------------------------------------
 
-def test_existing_profiles_have_gliner_off_and_load_unchanged(monkeypatch):
-    monkeypatch.setenv("EMBED_MODEL_ID", "org/embed")
-    for name in ("a100-3x40", "agent-3x40", "example"):
-        data = load_profile(ROOT / "profiles" / f"{name}.yaml")
-        assert "gliner" not in data          # the copied session profile stays as it was
-        assert gliner_settings(data) is None
+def test_gliner_is_off_unless_a_profile_adds_it():
+    assert load_profile(PROFILES / "orch.yaml", 3).gliner is None
+    assert load_profile(PROFILES / "heavy-lite-embed.yaml", 3).gliner is None
+    assert load_profile(PROFILES / "orch-gliner.yaml", 1).gliner is not None
+    assert orch_profile(enabled=False).gliner is None
+    assert load_profile(PROFILES / "orch-gliner.yaml", 3).extras() == ["gliner"]
 
 
-def test_enabled_gliner_gets_the_defaults_and_pinned_revision(monkeypatch):
-    data = agent_profile(enabled=True)
-    validate_profile(data)
-    settings = gliner_settings(data)
-    assert settings == {**GLINER_DEFAULTS, "enabled": True}
-    assert settings["gpu"] == 0 and settings["port"] == 8090
-    assert settings["model"] == "urchade/gliner_medium-v2.1"
-    assert settings["revision"] == "40ec419335d09393f298636f471328b722c6da9e"
+def test_an_empty_section_gets_the_defaults_and_pinned_revision():
+    gliner = parse_profile({**orch_data(), "gliner": {}}).gliner
+    assert gliner == Gliner(gpu=0, port=8090, model=GLINER_DEFAULTS["model"], revision=GLINER_DEFAULTS["revision"],
+                            max_chars=1500)
     # Another model without a revision is not given the default model's revision.
-    assert gliner_settings(agent_profile(enabled=True, model="org/other"))["revision"] is None
-    assert gliner_settings(agent_profile(enabled=False, gpu=1)) is None
+    assert orch_profile(model="org/other").gliner.revision is None
 
 
 def test_gliner_section_is_validated():
     for section, message in [
         ({"enabled": "yes"}, "gliner.enabled"),
-        ({"enabled": True, "device": "cuda"}, "unsupported gliner fields"),
-        ({"enabled": True, "port": 8001}, "port"),           # orch's port
-        ({"enabled": True, "port": 4000}, "port"),           # the gateway's
-        ({"enabled": True, "gpu": 5}, "GPU"),                # no model there: it shares a model's GPU
-        ({"enabled": True, "gpu": -1}, "gliner.gpu"),
-        ({"enabled": True, "model": ""}, "gliner.model"),
-        ({"enabled": True, "revision": " "}, "gliner.revision"),
+        ({"device": "cuda"}, "unsupported gliner fields"),
+        ({"port": 8001}, "port 8001"),             # orch's port
+        ({"port": 4000}, "port 4000"),             # the gateway's
+        ({"gpu": 5}, "serves no model"),           # it shares a model's GPU
+        ({"gpu": -1}, "gliner.gpu"),
+        ({"model": ""}, "gliner.model"),
+        ({"revision": " "}, "gliner.revision"),
+        ({"max_chars": 0}, "gliner.max_chars"),
     ]:
         with pytest.raises(ProfileError, match=message):
-            validate_profile(agent_profile(**section))
-    data = agent_profile()
-    data["models"]["gliner"] = data["models"].pop("sub")
-    with pytest.raises(ProfileError, match="reserved service name"):
-        validate_profile(data)
+            orch_profile(**section)
     with pytest.raises(ProfileError, match="gliner must be a mapping"):
-        validate_profile({**agent_profile(), "gliner": True})
-    validate_profile(agent_profile(enabled=True, gpu=2, port=8091, max_chars=3000))
-    with pytest.raises(ProfileError, match="gliner.max_chars"):
-        validate_profile(agent_profile(enabled=True, max_chars=0))
+        parse_profile({**orch_data(), "gliner": True})
+    data = orch_data()
+    data["models"]["gliner"] = data["models"].pop("orch")
+    with pytest.raises(ProfileError, match="reserved service name"):
+        parse_profile(data)
+    assert orch_profile(gpu=2, port=8091, max_chars=3000).gliner.gpu == 2
 
 
-def test_orch_3x40_with_gliner_enabled_validates():
-    data = load_profile(ROOT / "profiles" / "orch-3x40.yaml")
-    assert gliner_settings(data) is None
-    data["gliner"] = {"enabled": True, "gpu": 0, "port": 8090}
-    validate_profile(data)
-    settings = gliner_settings(data)
-    assert (settings["gpu"], settings["port"], settings["max_chars"]) == (0, 8090, 1500)
-    # The commented block in the file is the one documented: uncommented, it validates as is.
-    import yaml
-
-    text = (ROOT / "profiles" / "orch-3x40.yaml").read_text(encoding="utf-8")
-    block = "\n".join(line[2:] for line in text.splitlines() if line.startswith(("# gliner:", "#   ")))
-    data["gliner"] = yaml.safe_load(block)["gliner"]
-    validate_profile(data)
-    assert gliner_settings(data)["revision"] == GLINER_DEFAULTS["revision"]
-
-
-def test_cli_lists_the_extras_a_profile_needs(monkeypatch, tmp_path):
-    import yaml
-
-    data = agent_profile(enabled=True)
-    path = tmp_path / "gliner.yaml"
-    path.write_text(yaml.safe_dump(data))
+def test_cli_lists_the_extras_a_profile_needs():
     run = [sys.executable, "-m", "llm_setup.cli", "profile", "extras", "--profile"]
     env = {**__import__("os").environ, "PYTHONPATH": str(ROOT / "src")}
-    assert subprocess.run([*run, str(path)], capture_output=True, text=True, env=env,
-                          check=True).stdout.strip() == "gliner"
-    assert subprocess.run([*run, str(ROOT / "profiles" / "agent-3x40.yaml")], capture_output=True, text=True,
-                          env=env, check=True).stdout.strip() == ""
+    env.pop("CUDA_VISIBLE_DEVICES", None)          # extras must not need the GPUs
+    out = [subprocess.run([*run, str(PROFILES / name)], capture_output=True, text=True, env=env, check=True)
+           .stdout.strip() for name in ("orch-gliner.yaml", "orch.yaml")]
+    assert out == ["gliner", ""]
 
 
 # Server --------------------------------------------------------------------------------------------
@@ -238,10 +217,10 @@ def test_gliner_service_is_built_only_when_enabled(tmp_path):
     from llm_setup.supervisor import build_services
 
     env = {"LITELLM_MASTER_KEY": "k", "HF_TOKEN": "hf"}
-    plain = build_services(agent_profile(), env, tmp_path, "s1", "k")
-    assert list(plain) == ["orch", "sub", "sub-2", "gateway", "status"]
-    services = build_services(agent_profile(enabled=True, gpu=2), env, tmp_path, "s1", "k")
-    assert list(services) == ["orch", "sub", "sub-2", "gliner", "gateway", "status"]
+    plain = build_services(orch_profile(), env, tmp_path, "s1", "k")
+    assert list(plain) == ["orch", "orch-2", "orch-3", "gateway", "status"]
+    services = build_services(orch_profile(gpu=2), env, tmp_path, "s1", "k")
+    assert list(services) == ["orch", "orch-2", "orch-3", "gliner", "gateway", "status"]
     gliner = services["gliner"]
     assert gliner.command == [sys.executable, "-m", "llm_setup.gliner_server", "--model",
                               "urchade/gliner_medium-v2.1", "--port", "8090", "--max-chars", "1500", "--revision",
@@ -253,7 +232,7 @@ def test_gliner_service_is_built_only_when_enabled(tmp_path):
     assert gliner.log == tmp_path / "gliner.log"
     # The vLLM processes are launched exactly as without GLiNER.
     assert all(services[name].command == plain[name].command and services[name].env == plain[name].env
-               for name in ("orch", "sub", "sub-2"))
+               for name in ("orch", "orch-2", "orch-3"))
 
 
 def test_start_launches_gliner_after_the_models_and_before_the_gateway(tmp_path, monkeypatch):
@@ -265,12 +244,13 @@ def test_start_launches_gliner_after_the_models_and_before_the_gateway(tmp_path,
     monkeypatch.setattr(supervisor, "port_in_use", lambda port: False)
     monkeypatch.chdir(tmp_path)
     said: list[str] = []
-    supervisor.start("p.yaml", agent_profile(enabled=True), {"LITELLM_MASTER_KEY": "k"}, say=said.append)
-    assert order == [["orch", "sub", "sub-2"], ["gliner"], ["gateway"], ["status"]]
+    supervisor.start(orch_profile(gpu=0), {"LITELLM_MASTER_KEY": "k"},
+                     say=said.append)
+    assert order == [["orch", "orch-2", "orch-3"], ["gliner"], ["gateway"], ["status"]]
     assert any("gliner" in line and "GPU 0" in line for line in said)
     order.clear()
-    supervisor.start("p.yaml", agent_profile(), {"LITELLM_MASTER_KEY": "k"}, say=said.append)
-    assert order == [["orch", "sub", "sub-2"], ["gateway"], ["status"]]
+    supervisor.start(orch_profile(), {"LITELLM_MASTER_KEY": "k"}, say=said.append)
+    assert order == [["orch", "orch-2", "orch-3"], ["gateway"], ["status"]]
 
 
 def test_a_gliner_start_failure_leaves_the_stack_running(tmp_path, monkeypatch):
@@ -290,9 +270,8 @@ def test_a_gliner_start_failure_leaves_the_stack_running(tmp_path, monkeypatch):
     monkeypatch.setattr(supervisor, "port_in_use", lambda port: False)
     monkeypatch.chdir(tmp_path)
     said: list[str] = []
-    session = supervisor.start("p.yaml", agent_profile(enabled=True), {"LITELLM_MASTER_KEY": "k"},
-                               say=said.append)
-    assert launched == ["orch", "sub", "sub-2", "gliner", "gateway", "status"]
+    session = supervisor.start(orch_profile(gpu=0), {"LITELLM_MASTER_KEY": "k"}, say=said.append)
+    assert launched == ["orch", "orch-2", "orch-3", "gliner", "gateway", "status"]
     assert session.services["gliner"].state == "failed"
     assert (tmp_path / "runtime" / "current").read_text() == session.id
     assert any(line.startswith("gliner: start failed, continuing without it") for line in said)
@@ -305,20 +284,13 @@ def test_a_gliner_start_failure_leaves_the_stack_running(tmp_path, monkeypatch):
     assert launched.count("gliner") == 1
 
 
-def test_status_line_shows_a_gliner_that_is_down():
-    from llm_setup.cli import gliner_status_line
-
-    line = gliner_status_line({"port": 9}, {}, "s1")
-    assert line.split()[:3] == ["gliner", "-", "down"] and line.endswith("http://127.0.0.1:9")
-
-
 def test_start_refuses_a_busy_gliner_port(tmp_path, monkeypatch):
     from llm_setup import supervisor
 
     monkeypatch.setattr(supervisor, "port_in_use", lambda port: port == 8090)
     monkeypatch.chdir(tmp_path)
     with pytest.raises(RuntimeError, match="gliner :8090"):
-        supervisor.start("p.yaml", agent_profile(enabled=True), {"LITELLM_MASTER_KEY": "k"}, say=lambda _: None)
+        supervisor.start(orch_profile(gpu=0), {"LITELLM_MASTER_KEY": "k"}, say=lambda _: None)
 
 
 # Doctor --------------------------------------------------------------------------------------------
@@ -337,30 +309,31 @@ def test_doctor_checks_gliner_weights_backbone_and_health(tmp_path, monkeypatch)
     snapshot.mkdir(parents=True)
     (snapshot / "gliner_config.json").write_text(json.dumps({"model_name": "microsoft/deberta-v3-base"}))
     path = tmp_path / "p.yaml"
-    path.write_text(yaml.safe_dump(agent_profile(enabled=True)))
+    path.write_text(yaml.safe_dump(orch_data(gpu=0)))
 
     def run(command):
         return "0, 10, 40960\n1, 10, 40960\n2, 10, 40960\n" if command[0] == "nvidia-smi" else None
 
     rows = {name: (level, detail) for level, name, detail in
             checks(str(path), run=run, get=lambda *a, **k: None, root=tmp_path / "runtime")}
+    assert rows["profile"][0] == "PASS" and "orch-3 GPU 2 :8003" in rows["profile"][1]
     assert rows["weights gliner"][0] == "PASS"
     assert rows["weights gliner backbone"][0] == "WARN"
     assert "microsoft/deberta-v3-base" in rows["weights gliner backbone"][1]
     assert rows["GPU 0 (gliner)"][0] == "PASS"
-    plain = {name for _, name, _ in checks(str(ROOT / "profiles" / "agent-3x40.yaml"), run=run,
+    plain = {name for _, name, _ in checks(str(PROFILES / "orch.yaml"), run=run,
                                            get=lambda *a, **k: None, root=tmp_path / "runtime")}
     assert not any("gliner" in name for name in plain)
 
     # With a session running, its health is checked like a model's.
     runtime = tmp_path / "runtime"
-    monkeypatch.setattr("llm_setup.doctor.recorded_alive", lambda *a: ["gliner"])
+    monkeypatch.setattr("llm_setup.doctor.alive_services", lambda *a: ["gliner"])
     runtime.mkdir()
     (runtime / "current").write_text("20261025T000000Z-abcdef12")
     rows = {name: level for level, name, _ in checks(str(path), run=run, get=lambda *a, **k: None, root=runtime)}
     assert rows["gliner health"] == "FAIL"
     (runtime / "20261025T000000Z-abcdef12").mkdir()
-    from llm_setup.supervisor import record_event
+    from llm_setup.runtime import record_event
 
     record_event(runtime / "20261025T000000Z-abcdef12", "gliner", "start failed", "exited with status 1")
     rows = {name: (level, detail) for level, name, detail in
@@ -368,7 +341,7 @@ def test_doctor_checks_gliner_weights_backbone_and_health(tmp_path, monkeypatch)
     assert rows["recent events"][0] == "WARN" and "gliner start failed" in rows["recent events"][1]
 
 
-def test_sbatch_installs_the_extras_the_profile_enables():
-    script = (ROOT / "slurm" / "llm-stack.sbatch").read_text(encoding="utf-8")
+def test_the_batch_job_installs_the_extras_the_profile_needs():
+    script = (ROOT / "slurm" / "job.sh").read_text(encoding="utf-8")
     assert "profile extras --profile" in script
-    assert 'uv sync --python 3.13 --extra serve\n' in script     # the unchanged first install
+    assert "uv sync --python 3.13 --extra serve\n" in script     # the unchanged first install

@@ -1,0 +1,19 @@
+# orch-model on every GPU of the allocation: one replica per GPU, all behind one alias.
+#   1 GPU  -> orch on GPU 0, port 8001
+#   3 GPUs -> orch, orch-2, orch-3 on GPUs 0-2, ports 8001-8003; LiteLLM sends orch-model to the
+#             least busy replica, and orch-model-1/-2/-3 pin one.
+# Replicas run the same pinned weights, so results cached by model identity stay valid.
+name: orch
+models:
+  orch:
+    alias: orch-model
+    model: Qwen/Qwen3.8-27B-FP8
+    revision: 017b9c7af6b5689d5dd426a76e0bc077eb5ca20a
+    gpus: all
+    port: 8001
+    max_num_active_seqs: 8
+    max_num_queued_reqs: 8
+    max_model_len: 65536
+    gpu_memory_utilization: 0.92
+    kv_cache_dtype: auto
+    extra_args: [--reasoning-parser, qwen3, --generation-config, vllm, --enable-prefix-caching]

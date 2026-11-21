@@ -1,10 +1,23 @@
-"""Polling, status classification, and local FastAPI endpoints."""
+"""The status API: polls each model's /health and /metrics, classifies it, keeps one day of samples.
+
+    GET /healthz      liveness of this API
+    GET /v1/status    {"overall", "updatedAt", "models": {<alias or alias@port>: {...}}}
+    GET /v1/events    the supervisor's recent events
+    GET /metrics      the same numbers in Prometheus text format
+
+Run by the supervisor as ``python -m llm_setup.status <session folder>``.
+"""
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 import logging
+import sqlite3
+import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -13,17 +26,16 @@ import httpx
 from fastapi import FastAPI
 from fastapi.responses import PlainTextResponse
 
-from .history import History
 from .metrics import parse_metrics
-from .models import model_instances
+from .profile import Profile, load_profile
+from .runtime import read_events
 
-STATES = {"healthy", "busy", "saturated", "unavailable", "recovering", "unknown"}
+POLL_S = 5
 
 
 def classify(previous: str, reachable: bool, metrics: dict[str, Any],
              last_bad_at: float | None = None, now: float | None = None) -> str:
-    import time
-    instant = now if now is not None else time.time()
+    """healthy, busy, saturated, unavailable, or recovering (healthy within a minute of trouble)."""
     if not reachable:
         return "unavailable"
     waiting = metrics.get("waiting", 0)
@@ -35,55 +47,66 @@ def classify(previous: str, reachable: bool, metrics: dict[str, Any],
         state = "busy"
     else:
         state = "healthy"
+    instant = now if now is not None else time.time()
     if state == "healthy" and previous in {"unavailable", "saturated"} and last_bad_at and instant - last_bad_at < 60:
         return "recovering"
     return state
 
 
+class History:
+    """Compact SQLite samples, pruned after ``retention_seconds``."""
+
+    def __init__(self, path: str | Path, retention_seconds: int = 86400) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.retention_seconds = retention_seconds
+        with sqlite3.connect(self.path) as db:
+            db.execute("CREATE TABLE IF NOT EXISTS samples (ts REAL NOT NULL, alias TEXT NOT NULL, data TEXT NOT NULL)")
+            db.execute("CREATE INDEX IF NOT EXISTS samples_ts ON samples(ts)")
+
+    def add(self, alias: str, data: dict[str, Any], now: float | None = None) -> None:
+        timestamp = now if now is not None else time.time()
+        with sqlite3.connect(self.path) as db:
+            db.execute("INSERT INTO samples VALUES (?, ?, ?)", (timestamp, alias, json.dumps(data)))
+            db.execute("DELETE FROM samples WHERE ts < ?", (timestamp - self.retention_seconds,))
+
+    def recent(self, alias: str, seconds: int = 86400, now: float | None = None) -> list[dict[str, Any]]:
+        cutoff = (now if now is not None else time.time()) - seconds
+        with sqlite3.connect(self.path) as db:
+            rows = db.execute("SELECT data FROM samples WHERE alias=? AND ts>=? ORDER BY ts", (alias, cutoff)).fetchall()
+        return [json.loads(row[0]) for row in rows]
+
+
 class StatusMonitor:
-    def __init__(self, profile: dict[str, Any], history: History):
-        instances = model_instances(profile)
-        alias_counts = {item["alias"]: sum(other["alias"] == item["alias"] for other in instances)
-                        for item in instances}
-        self.targets = {
-            (item["alias"] if alias_counts[item["alias"]] == 1 else f"{item['alias']}@{item['port']}"):
-                {**item, "backend": f"http://127.0.0.1:{item['port']}"}
-            for item in instances
-        }
+    def __init__(self, profile: Profile, history: History) -> None:
+        self.targets = {key: instance.url for key, instance in profile.status_keys().items()}
         self.history = history
         self.last: dict[str, dict[str, Any]] = {}
         self.last_bad_at: dict[str, float] = {}
-        self.gateway = profile["gateway"]
 
     async def poll_once(self) -> dict[str, Any]:
-        import time
         now = time.time()
         async with httpx.AsyncClient(timeout=2) as client:
-            for alias, target in self.targets.items():
-                old = self.last.get(alias, {})
+            for key, backend in self.targets.items():
                 metrics: dict[str, Any] = {}
                 reachable = False
                 try:
-                    health = await client.get(target["backend"] + "/health")
-                    metric_response = await client.get(target["backend"] + "/metrics")
-                    reachable = health.is_success and metric_response.is_success
-                    metrics = parse_metrics(metric_response.text) if metric_response.is_success else {}
+                    health = await client.get(backend + "/health")
+                    response = await client.get(backend + "/metrics")
+                    reachable = health.is_success and response.is_success
+                    metrics = parse_metrics(response.text) if response.is_success else {}
                 except httpx.HTTPError:
                     pass
-                state = classify(old.get("state", "unknown"), reachable, metrics,
-                                 self.last_bad_at.get(alias), now)
+                state = classify(self.last.get(key, {}).get("state", "unknown"), reachable, metrics,
+                                 self.last_bad_at.get(key), now)
                 if state in {"unavailable", "saturated"}:
-                    self.last_bad_at[alias] = now
-                item = {"state": state, "backend": target["backend"],
-                        "running": metrics.get("running"), "waiting": metrics.get("waiting"),
-                        "kvCache": metrics.get("kvCache"),
-                        "queueP95Seconds": metrics.get("queueP95Seconds"),
-                        "latencyP95Seconds": metrics.get("latencyP95Seconds"),
-                        "preemptions": metrics.get("preemptions")}
+                    self.last_bad_at[key] = now
+                item = {"state": state, "backend": backend, **{name: metrics.get(name) for name in (
+                    "running", "waiting", "kvCache", "queueP95Seconds", "latencyP95Seconds", "preemptions")}}
                 if reachable:
                     item["lastHealthyAt"] = _iso(now)
-                self.last[alias] = {k: v for k, v in item.items() if v is not None}
-                self.history.add(alias, self.last[alias], now)
+                self.last[key] = {name: value for name, value in item.items() if value is not None}
+                self.history.add(key, self.last[key], now)
         return self.document()
 
     def document(self) -> dict[str, Any]:
@@ -100,40 +123,35 @@ def _iso(timestamp: float | None = None) -> str:
     return value.isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
-def read_events(session: Path | None, count: int = 50) -> list[dict[str, Any]]:
-    """The supervisor's recent events (start, exit, restart, stop) from the session folder."""
-    if session is None or not (session / "events.jsonl").exists():
-        return []
-    rows = []
-    for line in (session / "events.jsonl").read_text(encoding="utf-8").splitlines()[-count:]:
-        try:
-            rows.append(json.loads(line))
-        except ValueError:
-            continue
-    return rows
+_PROMETHEUS = (("running", "llm_requests_running", "gauge", "Current running requests"),
+               ("waiting", "llm_requests_waiting", "gauge", "Current waiting requests"),
+               ("kvCache", "llm_kv_cache_usage_ratio", "gauge", "KV cache usage ratio"),
+               ("queueP95Seconds", "llm_queue_time_seconds_p95", "gauge", "Backend request queue time p95"),
+               ("latencyP95Seconds", "llm_request_latency_seconds_p95", "gauge", "Backend end-to-end latency p95"),
+               ("preemptions", "llm_preemptions_total", "counter", "Requests paused because the KV cache was full"))
 
 
-def create_app(profile: dict[str, Any], history: History, session: Path | None = None) -> FastAPI:
+def create_app(profile: Profile, history: History, session: Path | None = None) -> FastAPI:
     monitor = StatusMonitor(profile, history)
-    app = FastAPI()
-    app.state.monitor = monitor
 
-    @app.on_event("startup")
-    async def start_polling() -> None:
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         async def loop() -> None:
             while True:
                 try:
                     await monitor.poll_once()
                 except Exception:
                     logging.getLogger(__name__).exception("status poll failed")
-                await asyncio.sleep(5)
-        app.state.poller = asyncio.create_task(loop())
+                await asyncio.sleep(POLL_S)
 
-    @app.on_event("shutdown")
-    async def stop_polling() -> None:
-        task = getattr(app.state, "poller", None)
-        if task:
+        task = asyncio.create_task(loop())
+        try:
+            yield
+        finally:
             task.cancel()
+
+    app = FastAPI(lifespan=lifespan)
+    app.state.monitor = monitor
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
@@ -151,27 +169,28 @@ def create_app(profile: dict[str, Any], history: History, session: Path | None =
 
     @app.get("/metrics", response_class=PlainTextResponse)
     async def prometheus() -> str:
-        lines = [
-            "# HELP llm_backend_up Backend health", "# TYPE llm_backend_up gauge",
-            "# HELP llm_requests_running Current running requests", "# TYPE llm_requests_running gauge",
-            "# HELP llm_requests_waiting Current waiting requests", "# TYPE llm_requests_waiting gauge",
-            "# HELP llm_kv_cache_usage_ratio KV cache usage ratio", "# TYPE llm_kv_cache_usage_ratio gauge",
-            "# HELP llm_queue_time_seconds_p95 Backend request queue time p95",
-            "# TYPE llm_queue_time_seconds_p95 gauge",
-            "# HELP llm_request_latency_seconds_p95 Backend end-to-end latency p95",
-            "# TYPE llm_request_latency_seconds_p95 gauge",
-            "# HELP llm_preemptions_total Requests paused because the KV cache was full",
-            "# TYPE llm_preemptions_total counter",
-        ]
-        for alias, item in monitor.last.items():
-            lines.append(f'llm_backend_up{{alias="{alias}"}} {int(item["state"] not in {"unavailable", "unknown"})}')
-            for key, metric in (("running", "llm_requests_running"), ("waiting", "llm_requests_waiting"),
-                                ("kvCache", "llm_kv_cache_usage_ratio"),
-                                ("queueP95Seconds", "llm_queue_time_seconds_p95"),
-                                ("latencyP95Seconds", "llm_request_latency_seconds_p95"),
-                                ("preemptions", "llm_preemptions_total")):
-                if item.get(key) is not None:
-                    lines.append(f'{metric}{{alias="{alias}"}} {item[key]}')
+        lines = ["# HELP llm_backend_up Backend health", "# TYPE llm_backend_up gauge"]
+        for _, metric, kind, text in _PROMETHEUS:
+            lines += [f"# HELP {metric} {text}", f"# TYPE {metric} {kind}"]
+        for key, item in monitor.last.items():
+            lines.append(f'llm_backend_up{{alias="{key}"}} {int(item["state"] not in {"unavailable", "unknown"})}')
+            lines += [f'{metric}{{alias="{key}"}} {item[name]}' for name, metric, _, _ in _PROMETHEUS
+                      if item.get(name) is not None]
         return "\n".join(lines) + "\n"
 
     return app
+
+
+def main() -> None:
+    import uvicorn
+
+    parser = argparse.ArgumentParser(prog="llm_setup.status")
+    parser.add_argument("session", type=Path, help="the session folder (runtime/<session-id>)")
+    args = parser.parse_args()
+    profile = load_profile(args.session / "profile.yaml")
+    app = create_app(profile, History(args.session / "status.sqlite3"), args.session)
+    uvicorn.run(app, host="127.0.0.1", port=profile.status_port, log_level="warning")
+
+
+if __name__ == "__main__":
+    main()

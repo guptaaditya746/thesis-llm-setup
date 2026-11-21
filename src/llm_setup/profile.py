@@ -1,4 +1,15 @@
-"""Profile loading, interpolation, and validation."""
+"""Serving profiles: which models run on which GPUs and ports.
+
+A profile file is read in three steps:
+
+1. ``${NAME}`` and ``${NAME:-default}`` are replaced from the environment;
+2. ``extends: other.yaml`` merges a base profile underneath this one (mappings merge, other values
+   are replaced);
+3. ``gpus: all`` becomes every GPU of the allocation that no other model claims, so one profile
+   serves one replica on a 1-GPU job and three on a 3-GPU job.
+
+The result is validated into a :class:`Profile`. Every service listens on 127.0.0.1 only.
+"""
 
 from __future__ import annotations
 
@@ -6,165 +17,298 @@ import os
 import re
 import shutil
 import subprocess
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-ALIASES = {"heavy": "heavy-model", "lite": "lite-model", "embed": "qwen-embed"}
-# ${NAME} takes the variable (empty when unset); ${NAME:-default} takes the default when unset or empty.
-_ENV = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)(?::-([^}]*))?\}")
-_DEFAULT_VLLM_HELP_TIMEOUT_SECONDS = 600
-# KV-cache storage types accepted by vLLM's --kv-cache-dtype. "auto" keeps the
-# model's own dtype; the FP8 variants roughly double the tokens that fit.
+HOST = "127.0.0.1"
+RESERVED = {"gateway", "status", "gliner"}
 KV_CACHE_DTYPES = {"auto", "fp8", "fp8_e4m3", "fp8_e5m2"}
-# vLLM tool-call parser names look like "hermes", "granite4", "granite-20b-fc".
-_PARSER_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
-# The optional GLiNER service (gliner_server.py): off unless a profile sets gliner.enabled: true. It
-# shares a GPU with a model. The revision pins the default model; another model brings its own.
-GLINER_DEFAULTS: dict[str, Any] = {"enabled": False, "gpu": 0, "port": 8090,
+# The optional GLiNER service. The revision pins the default model; another model brings its own.
+GLINER_DEFAULTS: dict[str, Any] = {"enabled": True, "gpu": 0, "port": 8090,
                                    "model": "urchade/gliner_medium-v2.1",
                                    "revision": "40ec419335d09393f298636f471328b722c6da9e",
-                                   "max_chars": 1500}   # longer /predict texts get HTTP 413
+                                   "max_chars": 1500}
+
+_ENV = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)(?::-([^}]*))?\}")
+_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
+_PARSER = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
+_TOP_FIELDS = {"name", "gateway_port", "status_port", "models", "gliner"}
+_MODEL_REQUIRED = {"alias", "model", "gpus", "port", "max_num_active_seqs", "max_num_queued_reqs",
+                   "max_model_len", "gpu_memory_utilization"}
+_MODEL_OPTIONAL = {"revision", "task", "extra_args"}
+_CHAT_ONLY = {"kv_cache_dtype", "tool_call_parser"}
+# Set by the launcher; in extra_args they would override it (the last flag wins), e.g. --host 0.0.0.0.
+_MANAGED_FLAGS = {"--host", "--port", "--served-model-name", "--tensor-parallel-size"}
 
 
 class ProfileError(ValueError):
-    """Invalid or unsupported serving profile."""
+    """Invalid profile, or one this machine cannot serve."""
 
 
-def load_profile(path: str | Path, *, check_vllm: bool = False) -> dict[str, Any]:
-    raw = Path(path).read_text(encoding="utf-8")
+@dataclass(frozen=True)
+class Model:
+    """One role: a model served under one alias, one vLLM process per GPU in ``gpus``."""
+
+    role: str
+    alias: str
+    model: str
+    gpus: tuple[int, ...]
+    port: int                       # the first replica's port; replica i listens on port + i
+    max_num_active_seqs: int
+    max_num_queued_reqs: int
+    max_model_len: int
+    gpu_memory_utilization: float
+    revision: str | None = None
+    task: str = "generate"          # or "embed"
+    kv_cache_dtype: str = "auto"
+    tool_call_parser: str | None = None
+    extra_args: tuple[str, ...] = ()
+
+    @property
+    def embed(self) -> bool:
+        return self.task == "embed"
+
+    @property
+    def instances(self) -> list[Instance]:
+        return [Instance(self, index, gpu, self.port + index) for index, gpu in enumerate(self.gpus)]
+
+
+@dataclass(frozen=True)
+class Instance:
+    """One vLLM process: a replica of a model on one GPU and one port."""
+
+    model: Model
+    index: int
+    gpu: int
+    port: int
+
+    @property
+    def name(self) -> str:
+        return self.model.role if self.index == 0 else f"{self.model.role}-{self.index + 1}"
+
+    @property
+    def url(self) -> str:
+        return f"http://{HOST}:{self.port}"
+
+
+@dataclass(frozen=True)
+class Gliner:
+    gpu: int
+    port: int
+    model: str
+    revision: str | None
+    max_chars: int
+
+
+@dataclass(frozen=True)
+class Profile:
+    name: str
+    models: dict[str, Model]
+    gateway_port: int = 4000
+    status_port: int = 8010
+    gliner: Gliner | None = None
+    source: str = ""
+    data: dict[str, Any] = field(default_factory=dict, compare=False, repr=False)   # resolved YAML
+
+    @property
+    def instances(self) -> list[Instance]:
+        return [instance for model in self.models.values() for instance in model.instances]
+
+    def gpus(self) -> list[tuple[str, int]]:
+        """(service, GPU index) of every GPU service."""
+        placed = [(instance.name, instance.gpu) for instance in self.instances]
+        return placed + ([("gliner", self.gliner.gpu)] if self.gliner else [])
+
+    def ports(self) -> dict[str, int]:
+        """Every service's port, by service name."""
+        ports = {instance.name: instance.port for instance in self.instances}
+        if self.gliner:
+            ports["gliner"] = self.gliner.port
+        return {**ports, "gateway": self.gateway_port, "status": self.status_port}
+
+    def status_keys(self) -> dict[str, Instance]:
+        """The key of each instance in the status API: its alias, or alias@port for replicas."""
+        return {(instance.model.alias if len(instance.model.gpus) == 1
+                 else f"{instance.model.alias}@{instance.port}"): instance for instance in self.instances}
+
+    def extras(self) -> list[str]:
+        """Optional dependency extras the profile needs beyond ``serve``."""
+        return ["gliner"] if self.gliner else []
+
+
+# Loading -------------------------------------------------------------------------------------------
+
+def load_profile(path: str | Path, gpu_count: int | None = None) -> Profile:
+    """Read, resolve and validate a profile. ``gpu_count`` sizes ``gpus: all``; by default the
+    allocation's visible GPUs are counted."""
+    profile = parse_profile(resolve_gpus(read_profile(path), gpu_count), source=str(path))
+    beyond = [f"{name} GPU {gpu}" for name, gpu in profile.gpus() if gpu_count is not None and gpu >= gpu_count]
+    if beyond:
+        raise ProfileError(f"the allocation has {gpu_count} GPU(s), but the profile places {', '.join(beyond)}")
+    return profile
+
+
+def read_profile(path: str | Path, _depth: int = 0) -> dict[str, Any]:
+    """The profile as a mapping, with the environment substituted and ``extends`` merged in."""
+    path = Path(path)
 
     def substitute(match: re.Match[str]) -> str:
-        value = os.environ.get(match.group(1), "")
-        return value if value else (match.group(2) or "")
+        return os.environ.get(match.group(1)) or match.group(2) or ""
 
-    data = yaml.safe_load(_ENV.sub(substitute, raw))
-    if os.environ.get("EMBED_MODEL_ID") and "embed" in data["models"]:
-        data["models"]["embed"]["model"] = os.environ["EMBED_MODEL_ID"]
-    validate_profile(data)
-    if check_vllm:
-        validate_vllm_options(data)
-        check_fp8_kv_cache(data)
-    return data
+    data = yaml.safe_load(_ENV.sub(substitute, path.read_text(encoding="utf-8")))
+    if not isinstance(data, dict):
+        raise ProfileError(f"{path}: a profile is a YAML mapping")
+    base = data.pop("extends", None)
+    if base is None:
+        return data
+    if not isinstance(base, str) or _depth >= 4:
+        raise ProfileError(f"{path}: extends must name one profile file (at most 4 levels)")
+    return _merge(read_profile(path.parent / base, _depth + 1), data)
 
 
-def validate_profile(data: Any) -> None:
-    if not isinstance(data, dict) or not isinstance(data.get("models"), dict) or not data["models"]:
-        raise ProfileError("profile.models must define at least one role")
-    allowed = {"name", "bind_host", "gateway", "status", "models", "storage", "gliner"}
-    unknown = set(data) - allowed
+def _merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in override.items():
+        both = isinstance(value, dict) and isinstance(merged.get(key), dict)
+        merged[key] = _merge(merged[key], value) if both else value
+    return merged
+
+
+def visible_gpu_count() -> int | None:
+    """GPUs this process may use: CUDA_VISIBLE_DEVICES (set by Slurm), else nvidia-smi; None if unknown."""
+    devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if devices is not None:
+        return len([item for item in devices.split(",") if item.strip() and item != "NoDevFiles"])
+    executable = shutil.which("nvidia-smi")
+    if not executable:
+        return None
+    try:
+        result = subprocess.run([executable, "-L"], capture_output=True, text=True, timeout=30, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return sum(line.startswith("GPU ") for line in result.stdout.splitlines()) if result.returncode == 0 else None
+
+
+def resolve_gpus(data: dict[str, Any], gpu_count: int | None = None) -> dict[str, Any]:
+    """Replace ``gpus: all`` with the GPUs of the allocation that no other model claims."""
+    models = data.get("models")
+    if not isinstance(models, dict):
+        return data
+    wanting = [role for role, model in models.items() if isinstance(model, dict) and model.get("gpus") == "all"]
+    if not wanting:
+        return data
+    if len(wanting) > 1:
+        raise ProfileError(f"only one model can use gpus: all (found {', '.join(wanting)})")
+    count = gpu_count if gpu_count is not None else visible_gpu_count()
+    if count is None:
+        raise ProfileError("gpus: all needs the allocation's GPUs: run inside the GPU job, or pass --gpus N")
+    claimed = {gpu for model in models.values() if isinstance(model, dict) and isinstance(model.get("gpus"), list)
+               for gpu in model["gpus"]}
+    free = [gpu for gpu in range(count) if gpu not in claimed]
+    if not free:
+        raise ProfileError(f"models.{wanting[0]}.gpus: all, but no GPU of {count} is left for it")
+    role = wanting[0]
+    return {**data, "models": {**models, role: {**models[role], "gpus": free}}}
+
+
+# Validation ----------------------------------------------------------------------------------------
+
+def parse_profile(data: Any, source: str = "") -> Profile:
+    if not isinstance(data, dict):
+        raise ProfileError("a profile is a YAML mapping")
+    unknown = set(data) - _TOP_FIELDS
     if unknown:
         raise ProfileError(f"unsupported profile fields: {', '.join(sorted(unknown))}")
     if not isinstance(data.get("name"), str) or not data["name"]:
         raise ProfileError("profile.name is required")
-    if not isinstance(data.get("storage"), dict) or not isinstance(data["storage"].get("database"), str):
-        raise ProfileError("storage.database path is required")
-    if set(data["storage"]) != {"database"}:
-        raise ProfileError("unsupported storage fields")
-    if data.get("bind_host") != "127.0.0.1":
-        raise ProfileError("bind_host must be 127.0.0.1 so vLLM stays loopback-only")
-    used_ports: set[int] = set()
-    used_gpus: set[int] = set()
-    aliases: set[str] = set()
-    service_names: set[str] = set()
-    for role, model in data["models"].items():
-        if not isinstance(role, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", role):
-            raise ProfileError(f"invalid model role name: {role!r}")
-        if role in {"gateway", "status", "gliner"}:
-            raise ProfileError(f"models.{role} conflicts with a reserved service name")
-        expected_alias = ALIASES.get(role)
-        if not isinstance(model, dict):
-            raise ProfileError(f"models.{role} must be a mapping")
-        supported_fields = {"alias", "model", "gpu", "port", "max_num_active_seqs",
-                            "max_num_queued_reqs", "max_model_len", "gpu_memory_utilization",
-                            "replicas", "extra_args", "revision"}
-        is_embed = model.get("task") == "embed"
-        if is_embed:
-            supported_fields.add("task")
-        else:
-            supported_fields.update({"kv_cache_dtype", "tool_call_parser"})
-        unknown = set(model) - supported_fields
-        if unknown:
-            raise ProfileError(f"unsupported fields for models.{role}: {', '.join(sorted(unknown))}")
-        if not isinstance(model.get("alias"), str) or not model["alias"]:
-            raise ProfileError(f"models.{role}.alias is required")
-        if expected_alias and model.get("alias") != expected_alias:
-            raise ProfileError(f"models.{role}.alias must be {expected_alias}")
-        if model["alias"] in aliases:
-            raise ProfileError(f"model alias {model['alias']} is used by more than one role")
-        aliases.add(model["alias"])
-        if not model.get("model"):
-            raise ProfileError(f"models.{role}.model is required; set EMBED_MODEL_ID if needed")
-        revision = model.get("revision")
-        if revision is not None and (not isinstance(revision, str) or not revision.strip()):
-            raise ProfileError(f"models.{role}.revision must be a non-empty commit or tag")
-        for key in ("gpu", "port", "max_num_active_seqs", "max_num_queued_reqs", "max_model_len"):
-            minimum = 0 if key == "gpu" else 1
-            if type(model.get(key)) is not int or model[key] < minimum:
-                raise ProfileError(f"models.{role}.{key} must be a positive integer")
-        replicas = model.get("replicas", [])
-        if not isinstance(replicas, list):
-            raise ProfileError(f"models.{role}.replicas must be a list")
-        instances = [{"gpu": model["gpu"], "port": model["port"]}, *replicas]
-        for index, replica in enumerate(instances, start=1):
-            if not isinstance(replica, dict) or set(replica) != {"gpu", "port"}:
-                raise ProfileError(f"models.{role}.replicas entries must define gpu and port")
-            for key in ("gpu", "port"):
-                minimum = 0 if key == "gpu" else 1
-                if type(replica.get(key)) is not int or replica[key] < minimum:
-                    raise ProfileError(f"models.{role}.replicas.{key} must be a positive integer")
-            if replica["gpu"] in used_gpus:
-                raise ProfileError(f"GPU {replica['gpu']} is assigned more than once")
-            if replica["port"] in used_ports:
-                raise ProfileError(f"port {replica['port']} is assigned more than once")
-            service_name = role if index == 1 else f"{role}-{index}"
-            if service_name in service_names or service_name in {"gateway", "status"}:
-                raise ProfileError(f"duplicate or reserved service name: {service_name}")
-            service_names.add(service_name)
-            used_gpus.add(replica["gpu"])
-            used_ports.add(replica["port"])
-        extra_args = model.get("extra_args", [])
-        if not isinstance(extra_args, list) or any(not isinstance(arg, str) or not arg for arg in extra_args):
-            raise ProfileError(f"models.{role}.extra_args must be a list of vLLM arguments")
-        try:
-            memory_fraction = float(model.get("gpu_memory_utilization", 0))
-        except (TypeError, ValueError) as exc:
-            raise ProfileError(f"models.{role}.gpu_memory_utilization must be numeric") from exc
-        if not 0 < memory_fraction <= 1:
-            raise ProfileError(f"models.{role}.gpu_memory_utilization must be in (0, 1]")
-        if model.get("kv_cache_dtype", "auto") not in KV_CACHE_DTYPES:
-            raise ProfileError(
-                f"models.{role}.kv_cache_dtype must be one of: {', '.join(sorted(KV_CACHE_DTYPES))}"
-            )
-        parser = model.get("tool_call_parser")
-        if parser is not None and (not isinstance(parser, str) or not _PARSER_NAME.fullmatch(parser)):
-            raise ProfileError(f"models.{role}.tool_call_parser must be a vLLM parser name such as hermes")
-    if not isinstance(data.get("gateway"), dict) or not isinstance(data.get("status"), dict):
-        raise ProfileError("gateway and status endpoint configuration is required")
-    for name in ("gateway", "status"):
-        if set(data[name]) != {"host", "port"}:
-            raise ProfileError(f"{name} must define only host and port")
-    endpoints = [data["gateway"], data["status"]]
-    endpoints += [{"host": "127.0.0.1", "port": p} for p in used_ports]
-    gliner = _validate_gliner(data.get("gliner"), used_gpus)
-    if gliner:
-        endpoints.append({"host": "127.0.0.1", "port": gliner["port"]})
-    if any(e.get("host") != "127.0.0.1" for e in endpoints):
-        raise ProfileError("all service hosts must be 127.0.0.1")
-    ports = [e.get("port") for e in endpoints]
-    if any(not isinstance(port, int) or not 1 <= port <= 65535 for port in ports):
-        raise ProfileError("service ports must be between 1 and 65535")
-    if len(set(ports)) != len(ports):
-        raise ProfileError("service ports must be unique")
-    if any(model.get("task") not in (None, "embed") for model in data["models"].values()):
-        raise ProfileError("model task, when set, must be embed")
-    if "embed" in data["models"] and data["models"]["embed"].get("task") != "embed":
-        raise ProfileError("models.embed.task must be embed")
+    if not isinstance(data.get("models"), dict) or not data["models"]:
+        raise ProfileError("profile.models must define at least one model")
+    models = {role: _model(role, raw) for role, raw in data["models"].items()}
+    gliner = _gliner(data.get("gliner"))
+    profile = Profile(name=data["name"], models=models,
+                      gateway_port=_integer(data.get("gateway_port", 4000), "gateway_port", 1),
+                      status_port=_integer(data.get("status_port", 8010), "status_port", 1),
+                      gliner=gliner, source=source, data=data)
+    _check_placement(profile)
+    return profile
 
 
-def _validate_gliner(section: Any, model_gpus: set[int]) -> dict[str, Any] | None:
-    """Check the optional gliner section; return its settings when it is enabled."""
+def _check_placement(profile: Profile) -> None:
+    """One process per GPU (GLiNER shares a model's), unique ports, aliases and service names."""
+    owners: dict[int, str] = {}
+    for instance in profile.instances:
+        if instance.gpu in owners:
+            raise ProfileError(f"GPU {instance.gpu} is assigned to both {owners[instance.gpu]} and {instance.name}")
+        owners[instance.gpu] = instance.name
+    if profile.gliner and profile.gliner.gpu not in owners:
+        raise ProfileError(f"gliner.gpu: GPU {profile.gliner.gpu} serves no model; GLiNER shares a model's GPU")
+    names = [instance.name for instance in profile.instances]
+    duplicate = {name for name in names if names.count(name) > 1} | (set(names) & RESERVED)
+    if duplicate:
+        raise ProfileError(f"duplicate or reserved service name: {', '.join(sorted(duplicate))}")
+    seen: dict[int, str] = {}
+    for name, port in profile.ports().items():
+        if not 1 <= port <= 65535:
+            raise ProfileError(f"port {port} of {name} is outside 1-65535")
+        if port in seen:
+            raise ProfileError(f"port {port} is assigned to both {seen[port]} and {name}")
+        seen[port] = name
+    aliases = [model.alias for model in profile.models.values()]
+    if len(set(aliases)) != len(aliases):
+        raise ProfileError("each model needs its own alias")
+
+
+def _model(role: Any, raw: Any) -> Model:
+    if not isinstance(role, str) or not _NAME.fullmatch(role):
+        raise ProfileError(f"invalid model role name: {role!r}")
+    if role in RESERVED:
+        raise ProfileError(f"models.{role} conflicts with a reserved service name")
+    if not isinstance(raw, dict):
+        raise ProfileError(f"models.{role} must be a mapping")
+    task = raw.get("task", "generate")
+    if task not in {"generate", "embed"}:
+        raise ProfileError(f"models.{role}.task must be generate or embed")
+    allowed = _MODEL_REQUIRED | _MODEL_OPTIONAL | (set() if task == "embed" else _CHAT_ONLY)
+    unknown = set(raw) - allowed
+    if unknown:
+        raise ProfileError(f"unsupported fields for models.{role}: {', '.join(sorted(unknown))}")
+    missing = _MODEL_REQUIRED - set(raw)
+    if missing:
+        raise ProfileError(f"models.{role} is missing: {', '.join(sorted(missing))}")
+    where = f"models.{role}"
+    gpus = raw["gpus"]
+    if not isinstance(gpus, list) or not gpus:
+        raise ProfileError(f"{where}.gpus must be a list of GPU indexes, or all")
+    gpus = [_integer(gpu, f"{where}.gpus", 0) for gpu in gpus]
+    fraction = raw["gpu_memory_utilization"]
+    if isinstance(fraction, bool) or not isinstance(fraction, int | float) or not 0 < fraction <= 1:
+        raise ProfileError(f"{where}.gpu_memory_utilization must be a number in (0, 1]")
+    if raw.get("kv_cache_dtype", "auto") not in KV_CACHE_DTYPES:
+        raise ProfileError(f"{where}.kv_cache_dtype must be one of: {', '.join(sorted(KV_CACHE_DTYPES))}")
+    parser = raw.get("tool_call_parser")
+    if parser is not None and (not isinstance(parser, str) or not _PARSER.fullmatch(parser)):
+        raise ProfileError(f"{where}.tool_call_parser must be a vLLM parser name such as hermes")
+    extra_args = raw.get("extra_args", [])
+    if not isinstance(extra_args, list) or any(not isinstance(arg, str) or not arg for arg in extra_args):
+        raise ProfileError(f"{where}.extra_args must be a list of vLLM arguments")
+    managed = sorted({arg.split("=", 1)[0] for arg in extra_args} & _MANAGED_FLAGS)
+    if managed:
+        raise ProfileError(f"{where}.extra_args may not set {', '.join(managed)}: the launcher sets it")
+    return Model(role=role, alias=_text(raw["alias"], f"{where}.alias"), model=_text(raw["model"], f"{where}.model"),
+                 gpus=tuple(gpus), port=_integer(raw["port"], f"{where}.port", 1),
+                 max_num_active_seqs=_integer(raw["max_num_active_seqs"], f"{where}.max_num_active_seqs", 1),
+                 max_num_queued_reqs=_integer(raw["max_num_queued_reqs"], f"{where}.max_num_queued_reqs", 1),
+                 max_model_len=_integer(raw["max_model_len"], f"{where}.max_model_len", 1),
+                 gpu_memory_utilization=float(fraction),
+                 revision=_optional_text(raw.get("revision"), f"{where}.revision"), task=task,
+                 kv_cache_dtype=raw.get("kv_cache_dtype", "auto"), tool_call_parser=parser,
+                 extra_args=tuple(extra_args))
+
+
+def _gliner(section: Any) -> Gliner | None:
     if section is None:
         return None
     if not isinstance(section, dict):
@@ -172,147 +316,30 @@ def _validate_gliner(section: Any, model_gpus: set[int]) -> dict[str, Any] | Non
     unknown = set(section) - set(GLINER_DEFAULTS)
     if unknown:
         raise ProfileError(f"unsupported gliner fields: {', '.join(sorted(unknown))}")
-    if "enabled" in section and type(section["enabled"]) is not bool:
+    settings = {**GLINER_DEFAULTS, **section}
+    if section.get("model", GLINER_DEFAULTS["model"]) != GLINER_DEFAULTS["model"] and "revision" not in section:
+        settings["revision"] = None
+    if type(settings["enabled"]) is not bool:
         raise ProfileError("gliner.enabled must be true or false")
-    for key, minimum in (("gpu", 0), ("port", 1), ("max_chars", 1)):
-        if key in section and (type(section[key]) is not int or section[key] < minimum):
-            raise ProfileError(f"gliner.{key} must be a positive integer")
-    for key in ("model", "revision"):
-        if key in section and (not isinstance(section[key], str) or not section[key].strip()):
-            raise ProfileError(f"gliner.{key} must be a non-empty string")
-    settings = _gliner_merge(section)
     if not settings["enabled"]:
         return None
-    if settings["gpu"] not in model_gpus:
-        raise ProfileError(f"gliner.gpu: GPU {settings['gpu']} serves no model; GLiNER shares a model's GPU")
-    return settings
+    return Gliner(gpu=_integer(settings["gpu"], "gliner.gpu", 0), port=_integer(settings["port"], "gliner.port", 1),
+                  model=_text(settings["model"], "gliner.model"),
+                  revision=_optional_text(settings["revision"], "gliner.revision"),
+                  max_chars=_integer(settings["max_chars"], "gliner.max_chars", 1))
 
 
-def _gliner_merge(section: dict[str, Any]) -> dict[str, Any]:
-    settings = {**GLINER_DEFAULTS, **section}
-    if "model" in section and "revision" not in section and section["model"] != GLINER_DEFAULTS["model"]:
-        settings["revision"] = None
-    return settings
+def _integer(value: Any, what: str, minimum: int) -> int:
+    if type(value) is not int or value < minimum:
+        raise ProfileError(f"{what} must be {'a positive' if minimum else 'a non-negative'} integer")
+    return value
 
 
-def gliner_settings(profile: dict[str, Any]) -> dict[str, Any] | None:
-    """The GLiNER service settings (defaults filled in) when the profile enables it, else None."""
-    section = profile.get("gliner")
-    if not isinstance(section, dict):
-        return None
-    settings = _gliner_merge(section)
-    return settings if settings["enabled"] is True else None
+def _text(value: Any, what: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ProfileError(f"{what} must be a non-empty string")
+    return value
 
 
-def profile_extras(profile: dict[str, Any]) -> list[str]:
-    """Optional dependency extras the profile's enabled services need, beyond `serve`."""
-    return ["gliner"] if gliner_settings(profile) else []
-
-
-def uses_kv_cache_dtype(profile: dict[str, Any] | None) -> bool:
-    """True when any role asks for a non-default KV-cache dtype."""
-    if not profile:
-        return False
-    return any(item.get("kv_cache_dtype", "auto") != "auto" for item in profile["models"].values())
-
-
-def _gpu_compute_capabilities() -> list[float]:
-    """Compute capability of each visible GPU from nvidia-smi; [] when unavailable."""
-    executable = shutil.which("nvidia-smi")
-    if not executable:
-        return []
-    try:
-        result = subprocess.run([executable, "--query-gpu=compute_cap", "--format=csv,noheader"],
-                                capture_output=True, text=True, check=False, timeout=30)
-    except (OSError, subprocess.TimeoutExpired):
-        return []
-    values = []
-    for line in result.stdout.splitlines():
-        try:
-            values.append(float(line.strip()))
-        except ValueError:
-            continue
-    return values
-
-
-def check_fp8_kv_cache(profile: dict[str, Any] | None) -> None:
-    """Refuse an FP8 KV cache that would make vLLM compile FlashInfer kernels at startup.
-
-    Before Hopper (compute capability 9.0), vLLM serves an FP8 KV cache with the
-    FlashInfer attention backend. Its kernels are JIT-compiled with nvcc unless
-    the ``flashinfer_jit_cache`` package is installed; Slurm images usually have
-    neither, and the backend then dies before /health answers.
-    """
-    if not uses_kv_cache_dtype(profile):
-        return
-    capabilities = _gpu_compute_capabilities()
-    if not capabilities or min(capabilities) >= 9.0:
-        return
-    import importlib.util
-
-    if importlib.util.find_spec("flashinfer_jit_cache") is not None or shutil.which("nvcc"):
-        return
-    raise ProfileError(
-        f"kv_cache_dtype fp8 on GPUs with compute capability {min(capabilities):g} needs the FlashInfer "
-        "attention backend, which JIT-compiles with nvcc; neither nvcc nor flashinfer-jit-cache is "
-        "available. Set kv_cache_dtype: auto, or install flashinfer-jit-cache matching the installed "
-        "flashinfer version. No services were started."
-    )
-
-
-def tool_call_parsers(profile: dict[str, Any] | None) -> set[str]:
-    """Tool-call parsers the profile asks for (roles that serve tool calling)."""
-    if not profile:
-        return set()
-    return {item["tool_call_parser"] for item in profile["models"].values() if item.get("tool_call_parser")}
-
-
-def validate_vllm_options(profile: dict[str, Any] | None = None) -> set[str]:
-    """Read installed CLI help and fail early if required launch flags are absent."""
-    executable = shutil.which("vllm")
-    if not executable:
-        raise ProfileError("vLLM is not installed or vllm is not on PATH")
-    timeout_value = os.environ.get(
-        "LLM_SETUP_VLLM_HELP_TIMEOUT_SECONDS", str(_DEFAULT_VLLM_HELP_TIMEOUT_SECONDS)
-    )
-    try:
-        timeout_seconds = float(timeout_value)
-    except ValueError as exc:
-        raise ProfileError("LLM_SETUP_VLLM_HELP_TIMEOUT_SECONDS must be a number") from exc
-    if not 1 <= timeout_seconds <= 3600:
-        raise ProfileError("LLM_SETUP_VLLM_HELP_TIMEOUT_SECONDS must be between 1 and 3600")
-    try:
-        result = subprocess.run([executable, "serve", "--help=all"], capture_output=True,
-                                text=True, check=False, timeout=timeout_seconds)
-    except subprocess.TimeoutExpired as exc:
-        raise ProfileError(
-            f"timed out after {timeout_seconds:g}s running vllm serve --help=all; "
-            "increase LLM_SETUP_VLLM_HELP_TIMEOUT_SECONDS if shared-filesystem imports are slow or blocked; "
-            "no services were started"
-        ) from exc
-    help_text = result.stdout + result.stderr
-    if result.returncode:
-        raise ProfileError(f"could not inspect vllm serve --help: {help_text[-1000:]}")
-    required = {"--host", "--port", "--gpu-memory-utilization", "--max-model-len", "--max-num-seqs",
-                "--served-model-name", "--runner", "--tensor-parallel-size"}
-    extra_flags = {arg.split("=", 1)[0] for item in (profile or {}).get("models", {}).values()
-                   for arg in item.get("extra_args", []) if arg.startswith("--")}
-    required.update(extra_flags)
-    if uses_kv_cache_dtype(profile):
-        required.add("--kv-cache-dtype")
-    parsers = tool_call_parsers(profile)
-    if parsers:
-        required.update({"--enable-auto-tool-choice", "--tool-call-parser"})
-    available = {flag for flag in required if flag in help_text}
-    missing = sorted(required - available)
-    if missing:
-        raise ProfileError("installed vLLM does not support required options: " + ", ".join(missing))
-    listed = re.search(r"--tool-call-parser\s+\{([^}]+)}", help_text)
-    if parsers and listed:
-        unknown = parsers - {name.strip() for name in listed.group(1).split(",")}
-        if unknown:
-            raise ProfileError("installed vLLM has no tool-call parser named: " + ", ".join(sorted(unknown)))
-    runner = re.search(r"--runner\s+\{([^}]+)}", help_text)
-    if not runner or "pooling" not in runner.group(1).split(","):
-        raise ProfileError("installed vLLM does not support the pooling runner required for embeddings")
-    return available
+def _optional_text(value: Any, what: str) -> str | None:
+    return None if value is None else _text(value, what)

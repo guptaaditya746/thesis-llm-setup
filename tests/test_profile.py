@@ -1,211 +1,122 @@
-import os
+"""Profiles: environment substitution, extends, gpus: all, and validation."""
+
 from pathlib import Path
 
 import pytest
 import yaml
 
-from llm_setup.profile import ProfileError, load_profile, validate_profile
+from llm_setup.profile import ProfileError, load_profile, parse_profile, read_profile, resolve_gpus
+
+ROOT = Path(__file__).resolve().parents[1]
+PROFILES = ROOT / "profiles"
 
 
-def profile():
-    os.environ["EMBED_MODEL_ID"] = "org/qwen-embedder"
-    return load_profile("profiles/a100-3x40.yaml")
+def raw(name: str, gpu_count: int = 3) -> dict:
+    return resolve_gpus(read_profile(PROFILES / f"{name}.yaml"), gpu_count)
 
 
-def test_profile_loads_and_substitutes_embedding_model():
-    data = profile()
-    assert data["models"]["embed"]["model"] == "org/qwen-embedder"
+def test_every_shipped_profile_validates():
+    for path in PROFILES.glob("*.yaml"):
+        assert load_profile(path, 3).instances
 
 
-def test_revision_must_be_a_nonempty_string():
-    data = profile()
-    data["models"]["heavy"]["revision"] = "abc123"
-    validate_profile(data)
-    data["models"]["heavy"]["revision"] = "  "
-    with pytest.raises(ProfileError, match="revision"):
-        validate_profile(data)
+def test_gpus_all_gives_one_replica_per_allocated_gpu():
+    one = load_profile(PROFILES / "orch.yaml", 1)
+    three = load_profile(PROFILES / "orch.yaml", 3)
+    assert [(i.name, i.gpu, i.port) for i in one.instances] == [("orch", 0, 8001)]
+    assert [(i.name, i.gpu, i.port) for i in three.instances] == [
+        ("orch", 0, 8001), ("orch-2", 1, 8002), ("orch-3", 2, 8003)]
+    # The replicas run the same model settings, so cached results stay valid across GPU counts.
+    assert one.models["orch"].model == three.models["orch"].model
+    assert one.models["orch"].revision == three.models["orch"].revision
 
 
-def test_duplicate_gpu_or_port_is_rejected():
-    data = profile()
-    data["models"]["lite"]["gpu"] = 0
-    with pytest.raises(ProfileError, match="GPU"):
-        validate_profile(data)
-    data = profile()
-    data["models"]["lite"]["port"] = 8002
-    with pytest.raises(ProfileError, match="port"):
-        validate_profile(data)
+def test_gpus_all_counts_the_visible_gpus_and_explains_when_it_cannot(monkeypatch):
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "4,5")
+    assert len(load_profile(PROFILES / "orch.yaml").instances) == 2
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES")
+    monkeypatch.setattr("llm_setup.profile.shutil.which", lambda _name: None)
+    with pytest.raises(ProfileError, match="--gpus N"):
+        load_profile(PROFILES / "orch.yaml")
 
 
-def test_queue_configuration_must_be_finite_and_profile_fields_supported():
-    data = profile()
-    data["models"]["heavy"]["max_num_queued_reqs"] = 0
-    with pytest.raises(ProfileError, match="positive integer"):
-        validate_profile(data)
-    data["models"]["heavy"]["max_num_queued_reqs"] = 7
-    validate_profile(data)
-    data["models"]["heavy"]["max_num_queued_request"] = 7
-    with pytest.raises(ProfileError, match="unsupported fields"):
-        validate_profile(data)
+def test_gpus_all_takes_only_gpus_no_other_model_claims():
+    data = read_profile(PROFILES / "heavy-lite-embed.yaml")
+    data["models"]["lite"]["gpus"] = "all"                  # heavy holds GPU 0, embed GPU 2
+    assert resolve_gpus(data, 4)["models"]["lite"]["gpus"] == [1, 3]
+    data = raw("orch")
+    data["models"]["other"] = {**data["models"]["orch"], "gpus": "all", "alias": "x"}
+    data["models"]["orch"]["gpus"] = "all"
+    with pytest.raises(ProfileError, match="only one model"):
+        resolve_gpus(data, 3)
 
 
-def test_profile_yaml_is_valid():
-    yaml.safe_load(Path("profiles/a100-3x40.yaml").read_text(encoding="utf-8"))
+def test_a_profile_needing_more_gpus_than_the_allocation_is_refused():
+    with pytest.raises(ProfileError, match="has 1 GPU"):
+        load_profile(PROFILES / "heavy-lite-embed.yaml", 1)
 
 
-def test_agent_profile_allows_custom_roles_replicas_and_extra_args(monkeypatch):
-    monkeypatch.delenv("EMBED_MODEL_ID", raising=False)
-    data = load_profile("profiles/agent-3x40.yaml")
-    assert set(data["models"]) == {"orch", "sub"}
-    assert data["models"]["sub"]["replicas"] == [{"gpu": 2, "port": 8004}]
-    data["models"]["sub"]["replicas"][0]["gpu"] = 1
-    with pytest.raises(ProfileError, match="GPU"):
-        validate_profile(data)
-
-
-def test_extra_args_flags_are_checked_against_vllm_help(monkeypatch):
-    from types import SimpleNamespace
-
-    from llm_setup.profile import validate_vllm_options
-
-    monkeypatch.setattr("llm_setup.profile.shutil.which", lambda _name: "/env/bin/vllm")
-    flags = ("--host --port --gpu-memory-utilization --max-model-len --max-num-seqs "
-             "--served-model-name --runner {auto,draft,generate,pooling} --tensor-parallel-size "
-             "--reasoning-parser --generation-config --enable-prefix-caching --enable-auto-tool-choice "
-             "--tool-call-parser {hermes}")
-    monkeypatch.setattr("llm_setup.profile.subprocess.run", lambda *_a, **_k:
-                        SimpleNamespace(stdout=flags, stderr="", returncode=0))
-    validate_vllm_options(load_profile("profiles/agent-3x40.yaml"))
-    monkeypatch.setattr("llm_setup.profile.subprocess.run", lambda *_a, **_k:
-                        SimpleNamespace(stdout=flags.replace("--generation-config", ""), stderr="", returncode=0))
-    with pytest.raises(ProfileError, match="--generation-config"):
-        validate_vllm_options(load_profile("profiles/agent-3x40.yaml"))
-
-
-def test_vllm_help_check_allows_slow_shared_filesystem_startup(monkeypatch):
-    from types import SimpleNamespace
-
-    from llm_setup.profile import validate_vllm_options
-
-    monkeypatch.setattr("llm_setup.profile.shutil.which", lambda _name: "/env/bin/vllm")
-    calls = []
-
-    def run(command, **kwargs):
-        calls.append((command, kwargs["timeout"]))
-        flags = "--host --port --gpu-memory-utilization --max-model-len --max-num-seqs " \
-                "--served-model-name --runner {auto,draft,generate,pooling} --tensor-parallel-size"
-        return SimpleNamespace(stdout=flags, stderr="", returncode=0)
-
-    monkeypatch.setattr("llm_setup.profile.subprocess.run", run)
-    validate_vllm_options()
-    assert calls == [(["/env/bin/vllm", "serve", "--help=all"], 600)]
-
-
-def test_vllm_help_timeout_has_actionable_error(monkeypatch):
-    import subprocess
-
-    from llm_setup.profile import validate_vllm_options
-
-    monkeypatch.setattr("llm_setup.profile.shutil.which", lambda _name: "/env/bin/vllm")
-    monkeypatch.setattr("llm_setup.profile.subprocess.run",
-                        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-                            subprocess.TimeoutExpired("vllm serve --help", 600)))
-    with pytest.raises(ProfileError, match="no services were started"):
-        validate_vllm_options()
-
-
-def test_kv_cache_dtype_is_validated_and_embed_cannot_set_it():
-    data = profile()
-    assert data["models"]["heavy"]["kv_cache_dtype"] == "auto"
-    data["models"]["heavy"]["kv_cache_dtype"] = "int4"
-    with pytest.raises(ProfileError, match="kv_cache_dtype"):
-        validate_profile(data)
-    data = profile()
-    data["models"]["embed"]["kv_cache_dtype"] = "fp8"
-    with pytest.raises(ProfileError, match="unsupported fields"):
-        validate_profile(data)
-
-
-def test_vllm_help_check_requires_kv_cache_flag_only_when_used(monkeypatch):
-    from types import SimpleNamespace
-
-    from llm_setup.profile import validate_vllm_options
-
-    flags = "--host --port --gpu-memory-utilization --max-model-len --max-num-seqs " \
-            "--served-model-name --runner {auto,draft,generate,pooling} --tensor-parallel-size"
-    monkeypatch.setattr("llm_setup.profile.shutil.which", lambda _name: "/env/bin/vllm")
-    monkeypatch.setattr("llm_setup.profile.subprocess.run",
-                        lambda *_a, **_k: SimpleNamespace(stdout=flags, stderr="", returncode=0))
-    data = profile()
-    for item in data["models"].values():
-        item.pop("tool_call_parser", None)
-    data["models"]["heavy"]["kv_cache_dtype"] = "fp8"
-    with pytest.raises(ProfileError, match="--kv-cache-dtype"):
-        validate_vllm_options(data)
-    data["models"]["heavy"]["kv_cache_dtype"] = "auto"
-    validate_vllm_options(data)
-
-
-def test_tool_call_parser_is_validated_against_the_installed_vllm(monkeypatch):
-    from types import SimpleNamespace
-
-    from llm_setup.profile import validate_vllm_options
-
-    base = "--host --port --gpu-memory-utilization --max-model-len --max-num-seqs " \
-           "--served-model-name --runner {auto,draft,generate,pooling} --tensor-parallel-size " \
-           "--kv-cache-dtype --enable-auto-tool-choice"
-    help_text = {"value": base + " --tool-call-parser {granite,granite4,hermes}"}
-    monkeypatch.setattr("llm_setup.profile.shutil.which", lambda _name: "/env/bin/vllm")
-    monkeypatch.setattr("llm_setup.profile.subprocess.run",
-                        lambda *_a, **_k: SimpleNamespace(stdout=help_text["value"], stderr="", returncode=0))
-    data = profile()
-    validate_vllm_options(data)
-    data["models"]["lite"]["tool_call_parser"] = "granite9"
-    with pytest.raises(ProfileError, match="granite9"):
-        validate_vllm_options(data)
-    help_text["value"] = base
-    with pytest.raises(ProfileError, match="--tool-call-parser"):
-        validate_vllm_options(profile())
-    data = profile()
-    data["models"]["embed"]["tool_call_parser"] = "hermes"
-    with pytest.raises(ProfileError, match="unsupported fields"):
-        validate_profile(data)
-
-
-def test_fp8_kv_cache_is_refused_on_ampere_without_a_compiler(monkeypatch):
-    from types import SimpleNamespace
-
-    from llm_setup import profile as profile_module
-
-    data = profile()
-    data["models"]["heavy"]["kv_cache_dtype"] = "fp8"
-    monkeypatch.setattr(profile_module.shutil, "which",
-                        lambda name: "/usr/bin/nvidia-smi" if name == "nvidia-smi" else None)
-    monkeypatch.setattr(profile_module.subprocess, "run",
-                        lambda *_a, **_k: SimpleNamespace(stdout="8.0\n8.0\n8.0\n", returncode=0))
-    monkeypatch.setattr("importlib.util.find_spec", lambda name: None)
-    with pytest.raises(ProfileError, match="kv_cache_dtype: auto"):
-        profile_module.check_fp8_kv_cache(data)
-    monkeypatch.setattr(profile_module.subprocess, "run",
-                        lambda *_a, **_k: SimpleNamespace(stdout="9.0\n", returncode=0))
-    profile_module.check_fp8_kv_cache(data)
-    data["models"]["heavy"]["kv_cache_dtype"] = "auto"
-    profile_module.check_fp8_kv_cache(data)
-
-
-def test_orch_only_profiles_serve_only_the_pinned_orch_model(monkeypatch):
-    monkeypatch.delenv("EMBED_MODEL_ID", raising=False)
-    agent = load_profile("profiles/agent-3x40.yaml")["models"]["orch"]
-    one = load_profile("profiles/orch-1x40.yaml")
-    three = load_profile("profiles/orch-3x40.yaml")
-    assert set(one["models"]) == set(three["models"]) == {"orch"}
-    assert one["models"]["orch"] == agent           # the same settings as the agent profile's orch
-    assert {k: v for k, v in three["models"]["orch"].items() if k != "replicas"} == agent
-    assert three["models"]["orch"]["replicas"] == [{"gpu": 1, "port": 8002}, {"gpu": 2, "port": 8003}]
-
-
-def test_env_default_is_used_when_unset_and_overridden_when_set(monkeypatch):
+def test_extends_merges_the_base_and_environment_defaults_apply(monkeypatch):
     monkeypatch.delenv("GLINER_PORT", raising=False)
-    assert load_profile("profiles/orch-3x40-gliner.yaml")["gliner"]["port"] == 8090
+    base = load_profile(PROFILES / "orch.yaml", 3)
+    gliner = load_profile(PROFILES / "orch-gliner.yaml", 3)
+    assert gliner.models == base.models and gliner.name == "orch-gliner"
+    assert gliner.gliner.port == 8090 and base.gliner is None
     monkeypatch.setenv("GLINER_PORT", "8091")
-    assert load_profile("profiles/orch-3x40-gliner.yaml")["gliner"]["port"] == 8091
+    assert load_profile(PROFILES / "orch-gliner.yaml", 3).gliner.port == 8091
+
+
+def test_extends_is_relative_to_the_profile_and_mappings_merge(tmp_path):
+    (tmp_path / "base.yaml").write_text(yaml.safe_dump(raw("orch")))
+    (tmp_path / "child.yaml").write_text("extends: base.yaml\nname: child\nmodels: {orch: {max_model_len: 4096}}\n")
+    child = load_profile(tmp_path / "child.yaml")
+    assert child.name == "child" and child.models["orch"].max_model_len == 4096
+    assert child.models["orch"].alias == "orch-model"
+
+
+def test_environment_variable_replaces_the_embedding_model(monkeypatch):
+    monkeypatch.setenv("EMBED_MODEL_ID", "org/qwen-embedder")
+    assert load_profile(PROFILES / "heavy-lite-embed.yaml").models["embed"].model == "org/qwen-embedder"
+
+
+@pytest.mark.parametrize(("change", "message"), [
+    (lambda d: d["models"]["lite"].update(gpus=[0]), "GPU 0 is assigned to both heavy and lite"),
+    (lambda d: d["models"]["lite"].update(port=8002), "port 8002 is assigned"),
+    (lambda d: d["models"]["heavy"].update(max_num_queued_reqs=0), "positive integer"),
+    (lambda d: d["models"]["heavy"].update(max_num_queued_request=7), "unsupported fields"),
+    (lambda d: d["models"]["heavy"].update(revision="  "), "revision"),
+    (lambda d: d["models"]["heavy"].update(kv_cache_dtype="int4"), "kv_cache_dtype"),
+    (lambda d: d["models"]["embed"].update(kv_cache_dtype="fp8"), "unsupported fields"),
+    (lambda d: d["models"]["embed"].update(tool_call_parser="hermes"), "unsupported fields"),
+    (lambda d: d["models"]["heavy"].update(gpu_memory_utilization=1.5), "gpu_memory_utilization"),
+    (lambda d: d["models"]["heavy"].update(gpus=[]), "gpus"),
+    (lambda d: d["models"]["lite"].update(alias="heavy-model"), "own alias"),
+    (lambda d: d["models"].update(gateway=d["models"].pop("lite")), "reserved"),
+    (lambda d: d.update(bind_host="0.0.0.0"), "unsupported profile fields"),
+    (lambda d: d.update(gateway_port=8001), "port 8001 is assigned"),
+    (lambda d: d["models"]["heavy"].pop("port"), "missing: port"),
+])
+def test_invalid_profiles_are_refused(change, message):
+    data = raw("heavy-lite-embed")
+    change(data)
+    with pytest.raises(ProfileError, match=message):
+        parse_profile(data)
+
+
+def test_replica_ports_cannot_collide_with_another_model():
+    data = raw("heavy-lite-embed")
+    data["models"]["embed"]["gpus"] = [2, 3]     # embed on 8001 and 8002, heavy's port
+    with pytest.raises(ProfileError, match="port 8002"):
+        parse_profile(data)
+
+
+def test_status_keys_name_replicas_by_port():
+    assert list(load_profile(PROFILES / "orch.yaml", 3).status_keys()) == [
+        "orch-model@8001", "orch-model@8002", "orch-model@8003"]
+    assert list(load_profile(PROFILES / "orch.yaml", 1).status_keys()) == ["orch-model"]
+
+
+def test_the_resolved_copy_a_session_stores_loads_without_gpus(tmp_path):
+    profile = load_profile(PROFILES / "orch-gliner.yaml", 3)
+    (tmp_path / "profile.yaml").write_text(yaml.safe_dump(profile.data))
+    assert load_profile(tmp_path / "profile.yaml").instances == profile.instances

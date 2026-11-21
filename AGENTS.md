@@ -2,37 +2,33 @@
 
 ## Map
 
-- `profiles/`: deployment values and aliases.
-- `src/llm_setup/`: validation (`profile.py`), launch (`supervisor.py`), startup phases from logs
-  (`phases.py`), the foreground watchdog (`watchdog.py`), checks (`doctor.py`), status, metrics, and CLI.
-- `slurm/`: the batch job that runs the stack.
-- `config/`: LiteLLM config template; runtime config is generated per session.
-- `docs/`: operator and consumer guidance.
-- `tests/`: GPU-free contract tests.
-- `runtime/`: local session state, logs, and SQLite; ignored by git.
+- `slurm/submit.sh`: login-node entry point (new job, or a step in an existing job with `--job`).
+- `slurm/job.sh`: runs inside the allocation; installs on node-local scratch and runs the supervisor.
+- `profiles/`: what runs where (`gpus: all`, `extends:`; see `docs/PROFILES.md`).
+- `src/llm_setup/`: `profile.py` (loading, validation), `supervisor.py` (start/stop), `watchdog.py`
+  (restarts), `vllm.py` and `gateway.py` (launch commands and the LiteLLM config), `runtime.py`
+  (session folders), `process.py` (ownership marker, signals), `status.py`, `doctor.py`, `cli.py`.
+- `tests/`: GPU-free tests. `runtime/`: session state and logs; ignored by git.
 
 ## Safe commands
 
-- `uv run llm-setup profile validate --profile profiles/a100-3x40.yaml`
-- `uv run llm-setup verify --profile profiles/a100-3x40.yaml`
-- `sbatch slurm/llm-stack.sbatch` (the stack as a batch job: `start --foreground` with restarts and a clean stop)
-- `slurm/start-in-job.sh <jobid>` (the same, as a step inside a GPU job you already hold)
-- `uv run llm-setup start --profile profiles/a100-3x40.yaml [--foreground]`
-- `uv run llm-setup doctor --profile profiles/a100-3x40.yaml`, `uv run llm-setup events`
-- `uv run llm-setup status`, `uv run llm-setup logs --service heavy`, `uv run llm-setup stop`
-- `uv run ruff check .` and `uv run pytest -q`
+- `uv run llm-setup profile show --profile profiles/orch.yaml --gpus 3`
+- `slurm/submit.sh [--gpus N] [--profile FILE]`, `slurm/submit.sh --job <jobid>`
+- `uv run llm-setup doctor`, `status`, `events`, `logs <service>`, `stop`
+- `uv run --extra dev ruff check .` and `uv run --extra dev pytest -q`
 
 ## Prohibited actions
 
 - Never edit the older `llm_setup` repository or the research harness from this project.
-- Never use broad process matching or kill a PID unless the recorded session marker matches.
-- Never bind vLLM to a non-loopback address, delete model caches, or clean outside this repository's `runtime/`.
+- Never use broad process matching or kill a PID unless it carries the session marker.
+- Never bind a service to a non-loopback address, delete model caches, override the cluster's
+  Hugging Face cache variables, or clean outside this repository's `runtime/`.
 - Never commit `.env`, tokens, API keys, Hugging Face credentials, or secrets in logs.
-- Never add cross-role fallback between Heavy, Lite, and Embed.
+- Never add fallbacks between different models in the gateway.
+- Never stop another user's process that holds one of our ports; move our port instead.
 
 ## Which document to read
 
-- Starting or stopping a Slurm session: `docs/OPERATIONS.md`.
-- Failures and recovery: `docs/DEBUGGING.md` and `docs/INCIDENTS.md`.
-- Calling the service: `docs/CONSUMERS.md`.
-- Changing model placement or capacity: `docs/MODEL_PROFILES.md`.
+- Starting, stopping, the cluster cache, GLiNER, load tests: `docs/OPERATIONS.md`.
+- Changing models, placement or capacity: `docs/PROFILES.md`.
+- Failures, recovery and the incident log: `docs/DEBUGGING.md`.
