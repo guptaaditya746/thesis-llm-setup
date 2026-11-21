@@ -202,3 +202,10 @@ def test_orch_only_profiles_serve_only_the_pinned_orch_model(monkeypatch):
     assert one["models"]["orch"] == agent           # the same settings as the agent profile's orch
     assert {k: v for k, v in three["models"]["orch"].items() if k != "replicas"} == agent
     assert three["models"]["orch"]["replicas"] == [{"gpu": 1, "port": 8002}, {"gpu": 2, "port": 8003}]
+
+
+def test_env_default_is_used_when_unset_and_overridden_when_set(monkeypatch):
+    monkeypatch.delenv("GLINER_PORT", raising=False)
+    assert load_profile("profiles/orch-3x40-gliner.yaml")["gliner"]["port"] == 8090
+    monkeypatch.setenv("GLINER_PORT", "8091")
+    assert load_profile("profiles/orch-3x40-gliner.yaml")["gliner"]["port"] == 8091

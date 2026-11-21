@@ -13,3 +13,12 @@
 3. Stop only the recorded session, start it again, then verify and smoke test.
 
 Collect profile copy, versions, non-sensitive logs, status JSON, and queue/inference latency samples before changing settings. Never collect tokens or credentials.
+
+## Log
+
+- 2026-11-21, gammaweb08, job 9844 (interactive allocation, gpu:ampere:3). First in-job start failed with
+  exit 127 (relative script path inside the container); second reached `start` and stopped with
+  `ports already in use: gliner :8090`: another user's vLLM had listened on 0.0.0.0:8090 for a day. No
+  model had loaded. Fixes: `slurm/start-in-job.sh` (absolute paths, `--gres` on the step), `GLINER_PORT`
+  override in `orch-3x40-gliner.yaml` (`${NAME:-default}` in profiles), a port hint in the start error,
+  and the DEBUGGING rows for both symptoms.

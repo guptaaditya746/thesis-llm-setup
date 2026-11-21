@@ -27,6 +27,17 @@ CPU-only test. The batch script's normal request is 64 GB. The runtime image lac
 required by Triton; the opt-in bootstrap installs it in the writable container before starting the
 stack. The bootstrap needs package repository access and does not modify the host environment.
 
+### Inside a job you already hold
+
+`slurm/start-in-job.sh <jobid>` runs the same batch script as an extra step of an existing allocation
+(`srun --jobid <jobid> --overlap --gres=gpu:ampere:3 --mem=0` with the same container flags), detached from
+the terminal, logging to `runtime/slurm-<jobid>.out`. Two details it handles, which a hand-typed `srun`
+gets wrong: the container starts in the image's own directory, so the script is called by its absolute
+path after `cd` into this repository (otherwise `bash: slurm/llm-stack.sbatch: No such file or directory`,
+exit 127); and an overlapping step sees no GPU unless it asks for the job's GPUs with `--gres`. Set
+`LLM_SETUP_CONTAINER=none` on a node with a native toolchain. Stop it with `scancel <jobid>.<step>`
+(`squeue -s -j <jobid>` lists steps) or by ending the job.
+
 A short CPU-only preflight on a selected node can inspect the same container environment without
 reserving GPUs. Choose an Ampere node with three GPUs available for the later stack, and replace
 `<node>` with its name:
@@ -127,7 +138,7 @@ is off in every profile; a profile turns it on with a `gliner` section:
 gliner:
   enabled: true
   gpu: 0                                   # a GPU that already serves a model: it shares it
-  port: 8090                               # loopback only, like every service
+  port: ${GLINER_PORT:-8090}               # loopback only; GLINER_PORT moves it off a port another user holds
   model: urchade/gliner_medium-v2.1        # the default
   revision: 40ec419335d09393f298636f471328b722c6da9e   # pinned; the default for the default model
   max_chars: 1500                          # longer /predict texts get HTTP 413, never a silent cut
@@ -152,12 +163,12 @@ With it enabled:
   required on Webis, use supported Hugging Face APIs inside the cluster-provided container environment,
   after checking the effective cache configuration. Do not prefetch on the login node.
 
-Its API (`127.0.0.1:8090`, from the same node or through an SSH tunnel): `GET /health`,
+Its API (`127.0.0.1:8090` unless `GLINER_PORT` moved it, from the same node or through an SSH tunnel): `GET /health`,
 `GET /info` -> `{"model", "revision", "device"}`, and `POST /predict` with
 `{"text": str, "labels": [str], "threshold": 0.5}` -> `{"entities": [{"start", "end", "text", "label",
 "score"}]}`, character offsets into `text`. A text longer than `max_chars` (reported by `/info`) gets
 HTTP 413: GLiNER medium reads about 384 words and would drop the rest without saying so. The evidence engine reads it from `GLINER_URL`
-(`export GLINER_URL=http://127.0.0.1:8090`).
+(`export GLINER_URL=http://127.0.0.1:${GLINER_PORT:-8090}`).
 
 GLiNER needs an estimated 1.5-2 GB on its GPU (not yet measured). A model at
 `gpu_memory_utilization: 0.92` leaves about 3 GB of a 40 GB A100, and a model restarted while GLiNER runs

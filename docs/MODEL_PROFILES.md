@@ -66,3 +66,6 @@ workloads can run at once. It also exposes `orch-model-1`, `-2` and `-3` to pin 
 Each replica has the per-GPU limits of `agent-3x40` (8 active, 8 queued). Replicas are separate vLLM processes with
 the same weights at temperature 0, but batching can still make two replicas give slightly different outputs.
 Results are cached by the pinned identity, not by the replica.
+
+Profiles may read environment variables: `${NAME}` (empty when unset) or `${NAME:-default}`. Use it for
+values an operator must change per node, such as `port: ${GLINER_PORT:-8090}` when another user holds a port.

@@ -16,6 +16,7 @@
 - `uv run llm-setup profile validate --profile profiles/a100-3x40.yaml`
 - `uv run llm-setup verify --profile profiles/a100-3x40.yaml`
 - `sbatch slurm/llm-stack.sbatch` (the stack as a batch job: `start --foreground` with restarts and a clean stop)
+- `slurm/start-in-job.sh <jobid>` (the same, as a step inside a GPU job you already hold)
 - `uv run llm-setup start --profile profiles/a100-3x40.yaml [--foreground]`
 - `uv run llm-setup doctor --profile profiles/a100-3x40.yaml`, `uv run llm-setup events`
 - `uv run llm-setup status`, `uv run llm-setup logs --service heavy`, `uv run llm-setup stop`

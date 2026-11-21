@@ -12,7 +12,8 @@ from typing import Any
 import yaml
 
 ALIASES = {"heavy": "heavy-model", "lite": "lite-model", "embed": "qwen-embed"}
-_ENV = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)\}")
+# ${NAME} takes the variable (empty when unset); ${NAME:-default} takes the default when unset or empty.
+_ENV = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)(?::-([^}]*))?\}")
 _DEFAULT_VLLM_HELP_TIMEOUT_SECONDS = 600
 # KV-cache storage types accepted by vLLM's --kv-cache-dtype. "auto" keeps the
 # model's own dtype; the FP8 variants roughly double the tokens that fit.
@@ -35,7 +36,8 @@ def load_profile(path: str | Path, *, check_vllm: bool = False) -> dict[str, Any
     raw = Path(path).read_text(encoding="utf-8")
 
     def substitute(match: re.Match[str]) -> str:
-        return os.environ.get(match.group(1), "")
+        value = os.environ.get(match.group(1), "")
+        return value if value else (match.group(2) or "")
 
     data = yaml.safe_load(_ENV.sub(substitute, raw))
     if os.environ.get("EMBED_MODEL_ID") and "embed" in data["models"]:

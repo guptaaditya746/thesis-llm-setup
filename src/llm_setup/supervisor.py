@@ -322,7 +322,10 @@ def start(profile_path: str | Path, profile: dict[str, Any], env: dict[str, str]
     busy = [f"{name} :{port}" for name, port in ports.items() if port_in_use(port)]
     if busy:
         raise RuntimeError(f"ports already in use: {', '.join(busy)}; another server (or a session that was "
-                           "not stopped) holds them. `llm-setup doctor` shows more")
+                           "not stopped) holds them. `ss -ltnp | grep :<port>` and `ps -eo user,pid,cmd` show "
+                           "the holder; on a shared node it can be another user's job: move only our port "
+                           "(e.g. GLINER_PORT=8091 for profiles that read it) instead of stopping theirs. "
+                           "`llm-setup doctor` shows more")
     session_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
     path = root / session_id
     path.mkdir()
