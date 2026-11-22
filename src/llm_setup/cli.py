@@ -77,7 +77,12 @@ def _start(args: argparse.Namespace) -> int:
     began = time.monotonic()
 
     def say(text: str) -> None:
-        print(f"[{clock(time.monotonic() - began)}] {text}", flush=True)
+        # The job log reaches the shared filesystem through a pipe (slurm/job.sh); a closed or stuck
+        # pipe must not stop the supervisor from stopping the services.
+        try:
+            print(f"[{clock(time.monotonic() - began)}] {text}", flush=True)
+        except OSError:
+            pass
 
     say(f"checking {args.profile} and the installed vLLM")
     visible = visible_gpu_count()
@@ -103,11 +108,11 @@ def _stop(_args: argparse.Namespace) -> int:
 
 
 def _running_session() -> tuple[str, Path]:
-    runtime = Runtime()
+    runtime = Runtime.default()
     session_id = runtime.current_id()
     if not session_id:
         raise RuntimeError("no running session")
-    return session_id, runtime.root / session_id
+    return session_id, runtime.session_path(session_id)
 
 
 def _status(_args: argparse.Namespace) -> int:
@@ -144,7 +149,7 @@ def _status(_args: argparse.Namespace) -> int:
 
 
 def _events(args: argparse.Namespace) -> int:
-    session = Runtime().latest()
+    session = Runtime.default().latest()
     rows = read_events(session, args.count)
     if not rows:
         raise RuntimeError("no events recorded yet")
@@ -155,7 +160,7 @@ def _events(args: argparse.Namespace) -> int:
 
 
 def _logs(args: argparse.Namespace) -> int:
-    session = Runtime().latest()
+    session = Runtime.default().latest()
     if session is None:
         raise RuntimeError("no session recorded in runtime/")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", args.service):

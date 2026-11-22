@@ -344,4 +344,4 @@ def test_doctor_checks_gliner_weights_backbone_and_health(tmp_path, monkeypatch)
 def test_the_batch_job_installs_the_extras_the_profile_needs():
     script = (ROOT / "slurm" / "job.sh").read_text(encoding="utf-8")
     assert "profile extras --profile" in script
-    assert "uv sync --python 3.13 --extra serve\n" in script     # the unchanged first install
+    assert "uv sync --python 3.13 --extra serve --no-editable\n" in script     # the unchanged first install

@@ -19,7 +19,7 @@ import httpx
 
 from .logs import last_line
 from .runtime import Runtime, record_event
-from .supervisor import Say, Service, Session, clock, terminate
+from .supervisor import Say, Service, Session, clock, start_mirror, stop_mirror, terminate
 
 MODEL_RESTARTS_PER_HOUR = 3
 SERVICE_RESTARTS_PER_HOUR = 20
@@ -38,7 +38,7 @@ class Watchdog:
         self.status_url = status_url
         self.check_s = check_s
         self.summary_s = summary_s
-        self.runtime = runtime or Runtime()
+        self.runtime = runtime or Runtime.default()
         self.stop = threading.Event()
         self.reason = "stopped"
         self.failures: dict[str, int] = {}
@@ -70,6 +70,7 @@ class Watchdog:
                 break
             for service in self.session.services.values():
                 self.check(service)
+            self.check_mirror()
             if time.monotonic() - last_summary >= self.summary_s:
                 last_summary = time.monotonic()
                 self.say(self.summary())
@@ -77,8 +78,17 @@ class Watchdog:
         stopped = terminate(self.session, say=self.say)
         self.runtime.clear_current(only=self.session.id)
         self.event("session", "stopped", ", ".join(stopped) or "nothing was running")
+        stop_mirror(self.session)
         failed = [name for name, item in self.session.services.items() if item.state == "failed"]
         return 1 if failed else 0
+
+    def check_mirror(self) -> None:
+        """The mirror only exits on its own once the session is over: before that, an exit is a crash."""
+        mirror, target = self.session.mirror, self.session.mirror_target
+        if mirror is None or target is None or mirror.poll() is None:
+            return
+        self.event("mirror", "restarted", f"exited with status {mirror.returncode}; see mirror.log")
+        self.session.mirror = start_mirror(self.session.path, target, self.session.id)
 
     def check(self, service: Service) -> None:
         if service.state == "failed":
@@ -138,7 +148,7 @@ class Watchdog:
 
     def _stopped_elsewhere(self) -> bool:
         try:
-            return self.runtime.current_id() != self.session.id
+            return self.runtime.current_id(shared=False) != self.session.id
         except (OSError, RuntimeError):
             return True
 

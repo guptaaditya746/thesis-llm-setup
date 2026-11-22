@@ -267,3 +267,61 @@ def test_logs_refuses_a_path_as_service_name(tmp_path, monkeypatch, capsys) -> N
     with pytest.raises(SystemExit) as code:
         main(["logs", "../../etc/x"])
     assert code.value.code == 1 and "not a service name" in capsys.readouterr().err
+
+
+def test_a_mirrored_session_works_locally_and_copies_to_the_shared_folder(tmp_path) -> None:
+    from llm_setup.mirror import STOP_REQUEST, Mirror, sync
+
+    shared, local = tmp_path / "shared", tmp_path / "local"
+    shared.mkdir()
+    local.mkdir()
+    runtime = Runtime(shared, local)
+    session_id, path = runtime.new_session()
+    assert path.parent == local and runtime.mirrored
+    (path / "metadata.json").write_text(json.dumps({"host": "another-node", "work": str(path),
+                                                    "mirror": str(shared / session_id)}))
+    (path / "processes.json").write_text(json.dumps({"sessionId": session_id, "services": {"orch": {"pid": 1}}}))
+    (path / "orch.log").write_text("one\n")
+    (path / "status.sqlite3-journal").write_text("x")
+    seen: dict[str, tuple[int, int]] = {}
+    sync(path, shared / session_id, seen)
+    with (path / "orch.log").open("a") as handle:
+        handle.write("two\n")
+    sync(path, shared / session_id, seen)
+    assert (shared / session_id / "orch.log").read_text() == "one\ntwo\n"
+    assert not (shared / session_id / "status.sqlite3-journal").exists()
+
+    # A line written into the copy by someone else: the next copy is whole, not spliced.
+    with (shared / session_id / "orch.log").open("a") as handle:
+        handle.write("foreign\n")
+    with (path / "orch.log").open("a") as handle:
+        handle.write("three\n")
+    sync(path, shared / session_id, seen)
+    assert (shared / session_id / "orch.log").read_text() == "one\ntwo\nthree\n"
+
+    # Once ready the mirror names the session in the shared folder. A login shell (no local root set)
+    # sees only the copy, recorded on another host, so it asks for a stop instead of signalling.
+    runtime.mark_current(session_id)
+    mirror = Mirror(path, shared / session_id, every=0, parent=1)
+    mirror.was_current = True
+    mirror.name_session()
+    login = Runtime(shared)
+    assert login.current_id() == session_id and login.session_path(session_id) == shared / session_id
+    assert stop(login) == ["orch (asked; stops within a minute)"]
+    assert (shared / "current").exists() and (shared / session_id / STOP_REQUEST).exists()
+    mirror.pass_on_stop_request()                  # on the node: the real stop clears `current`
+    assert runtime.current_id(shared=False) is None and not (shared / session_id / STOP_REQUEST).exists()
+    assert not mirror.over(False) and mirror.over(False)   # nothing alive, on two checks in a row
+    mirror.finish()
+    assert not (shared / "current").exists()
+
+
+def test_a_start_leaves_another_nodes_session_alone(tmp_path) -> None:
+    root = tmp_path / "runtime"
+    session_id = "20260101T000000Z-dddddddd"
+    (root / session_id).mkdir(parents=True)
+    (root / "current").write_text(session_id)
+    (root / session_id / "metadata.json").write_text(json.dumps({"host": "another-node"}))
+    said: list[str] = []
+    clear_stale(Runtime(root), said.append)
+    assert (root / "current").read_text() == session_id and "another-node" in said[0]

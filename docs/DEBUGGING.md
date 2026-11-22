@@ -31,7 +31,7 @@ supervisor saw; `llm-setup logs <service>` works for the last session too, also 
 ## Incidents
 
 When overloaded: capture `/v1/status`, the model logs and the last hour of
-`runtime/<session>/status.sqlite3`. Queue time rising while inference time stays flat means
+`runtime/<session>/status.sqlite3` (a copy up to a minute old; the live one is node-local). Queue time rising while inference time stays flat means
 admission pressure; both rising means model or context pressure. Reduce caller concurrency first.
 Collect profile, versions, logs and latency samples before changing settings; never tokens.
 
@@ -49,6 +49,11 @@ Collect profile, versions, logs and latency samples before changing settings; ne
   that evening a SIGKILLed step left our ports held (`ports already in use` on the next start), and a
   start hung 14 minutes in `apt-get`. Fixes: `terminate()` grace 30 → 20 s (below Slurm `KillWait`
   30 s), `slurm/build-image.sh` (no `apt-get` at start), the two DEBUGGING rows above.
-  Open: (1) service logs and SQLite are on Ceph (`runtime/`); a Ceph stall can leave a process
-  unkillable, so write them to node-local scratch and copy back on stop; (2) expose health without
-  a new Slurm step; (3) find what 10167 ran and why it got signal 9 (64 GB memory limit?).
+  Open: (1) expose health without a new Slurm step; (2) find what 10167 ran and why it got signal 9
+  (64 GB memory limit?).
+- 2026-11-22, gammaweb08: jobs 10178 (llm-stack) and 10167 (a bare `bash`) stuck in CG; the node went
+  `MIXED+COMPLETING+NOT_RESPONDING`. All six service logs in `runtime/<session>/` stopped in the same
+  second (20:37:17) and no "stopping" event was written: the Ceph mount hung, not our shutdown.
+  Fix: the session folder is node-local, copied to `runtime/` every minute by `llm_setup.mirror` (the
+  only session process writing to Ceph); the job log goes through a SIGTERM-ignoring `cat`; the
+  package is installed non-editable. A hard Ceph hang still holds the mirror/`cat` in CG: admins.

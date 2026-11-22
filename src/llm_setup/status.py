@@ -185,7 +185,7 @@ def main() -> None:
     import uvicorn
 
     parser = argparse.ArgumentParser(prog="llm_setup.status")
-    parser.add_argument("session", type=Path, help="the session folder (runtime/<session-id>)")
+    parser.add_argument("session", type=Path, help="the session folder (runtime/<session-id>, node-local in a Slurm job)")
     args = parser.parse_args()
     profile = load_profile(args.session / "profile.yaml")
     app = create_app(profile, History(args.session / "status.sqlite3"), args.session)

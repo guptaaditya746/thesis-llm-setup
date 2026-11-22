@@ -43,7 +43,16 @@ package mirror cannot stall the start), gives vLLM a per-job rendezvous port blo
 - on SIGTERM (`scancel`, or `--signal=B:TERM@180` before the time limit) or Ctrl-C stops every
   process of the session (SIGTERM to each process group, SIGKILL after 30 s).
 
-Every event goes to `runtime/<session>/events.jsonl` (`llm-setup events`, `GET :8010/v1/events`).
+Every event goes to `events.jsonl` in the session folder (`llm-setup events`, `GET :8010/v1/events`).
+
+The session folder lives on node-local disk (`$LLM_SETUP_LOCAL_ROOT/runtime/<session>`): the services
+and the supervisor never write to Ceph. A separate mirror process (`llm_setup.mirror`) copies it to
+`runtime/<session>` every minute and once more at stop, so on the login node logs and events are up
+to a minute old. If Ceph hangs, only the mirror (and `cat` feeding the job log) wait; the GPU services
+keep running and stop on `scancel`. A process stuck on a hung Ceph still keeps the job in CG until Ceph
+recovers; that needs the admins. `llm-setup stop` from a shell that cannot see the node-local folder
+(the login node, or a shell outside the job's container) writes `runtime/<session>/stop-requested`;
+the mirror stops the session within a minute. `scancel` is still the usual stop.
 Only processes carrying the session's marker are ever signalled.
 
 ## Model cache (Webis)

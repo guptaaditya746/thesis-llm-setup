@@ -40,7 +40,7 @@ stamp "ports from a workstation:  ssh -L 4000:127.0.0.1:4000 -L 8010:127.0.0.1:8
 
 stamp "installing Python and the serving environment on node-local scratch (a few minutes)"
 uv python install 3.13
-uv sync --python 3.13 --extra serve
+uv sync --python 3.13 --extra serve --no-editable
 # A service the profile adds beyond the models (GLiNER) needs its extra too.
 needed="$("$UV_PROJECT_ENVIRONMENT/bin/llm-setup" profile extras --profile "$PROFILE")"
 extras=()
@@ -49,10 +49,15 @@ for extra in $needed; do
 done
 if [ ${#extras[@]} -gt 0 ]; then
   stamp "the profile also needs: ${extras[*]}"
-  uv sync --python 3.13 --extra serve "${extras[@]}"
+  uv sync --python 3.13 --extra serve --no-editable "${extras[@]}"
 fi
 
 # llm-setup replaces this shell, so Slurm's SIGTERM (scancel, the time limit) reaches it directly.
+# Its session folder is node-local ($LLM_SETUP_LOCAL_ROOT/runtime, copied to runtime/ every minute), so
+# the services never write to the shared filesystem. Its own output reaches the job log on that
+# filesystem through `cat`, which ignores SIGTERM so the supervisor's last lines still arrive: if the
+# filesystem hangs, cat waits and llm-setup keeps running and can still stop the GPU services. The
+# package is installed non-editable, so a restarted service imports nothing from the shared filesystem.
 export PATH="$UV_PROJECT_ENVIRONMENT/bin:$PATH"
 stamp "starting the stack in the foreground"
-exec "$UV_PROJECT_ENVIRONMENT/bin/llm-setup" start --profile "$PROFILE" --foreground
+exec "$UV_PROJECT_ENVIRONMENT/bin/llm-setup" start --profile "$PROFILE" --foreground > >(trap '' TERM INT HUP; exec cat) 2>&1

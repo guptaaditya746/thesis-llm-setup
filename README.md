@@ -109,7 +109,8 @@ src/llm_setup/
   supervisor.py        start order, health waits, clean stop
   watchdog.py          restarts with back-off, health reports, SIGTERM handling
   vllm.py, gateway.py  vLLM command/environment and checks; the LiteLLM config
-  runtime.py           runtime/<session>/: logs, events, process records
+  runtime.py           runtime/<session>/: logs, events, process records (node-local in a job)
+  mirror.py            copies the node-local session folder to runtime/ every minute
   process.py           session-owned processes only: marker, signals, GPU mapping
   status.py, metrics.py  the status API
   doctor.py            doctor and smoke checks

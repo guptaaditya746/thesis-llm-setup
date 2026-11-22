@@ -119,9 +119,9 @@ def checks(profile_path: str, *, gpu_count: int | None = None, run: Callable[[li
         rows.append(("FAIL", "profile", str(exc)))
         return rows
 
-    runtime = Runtime(root)
+    runtime = Runtime.default() if root == Path("runtime") else Runtime(root)
     session_id = runtime.current_id()
-    alive = alive_services(root / session_id, session_id) if session_id else []
+    alive = alive_services(runtime.session_path(session_id), session_id) if session_id else []
     if not session_id:
         rows.append(("INFO", "session", "none running"))
     elif alive:
@@ -196,7 +196,7 @@ def checks(profile_path: str, *, gpu_count: int | None = None, run: Callable[[li
         overall = None
     rows.append(("PASS" if overall in {"healthy", "busy", "recovering"} else "WARN" if overall else "FAIL",
                  "status API", overall or "no answer"))
-    trouble = [row for row in read_events(root / session_id, 5)
+    trouble = [row for row in read_events(runtime.session_path(session_id), 5)
                if row.get("event") in {"exited", "exited again", "gave up restarting", "start failed"}]
     if trouble:
         rows.append(("WARN", "recent events", "; ".join(f"{row['time']} {row['service']} {row['event']}"
