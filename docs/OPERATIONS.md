@@ -26,7 +26,9 @@ Stop it with `scancel <jobid>.<step>` (`squeue -s -j <jobid>` lists steps) or by
 `slurm/job.sh` sources `.env`, installs Python 3.13 and the serving environment on node-local
 scratch (`LLM_SETUP_LOCAL_ROOT`; importing torch and vLLM from the shared filesystem can stall),
 adds the extras the profile needs (GLiNER), installs a C compiler for Triton in the container if
-missing, gives vLLM a per-job rendezvous port block, then runs `llm-setup start --foreground`, which:
+missing (skipped with the prebuilt image: run `slurm/build-image.sh`
+once; it saves `runtime/images/pytorch-2.8.0-cuda12.9-gcc.sqsh`, which `submit.sh` then uses, so a slow
+package mirror cannot stall the start), gives vLLM a per-job rendezvous port block, then runs `llm-setup start --foreground`, which:
 
 - starts every model replica **in parallel**, then GLiNER, then LiteLLM, then the status API, each
   only after the previous ones answer their health check;

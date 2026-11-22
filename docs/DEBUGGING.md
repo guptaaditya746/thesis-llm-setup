@@ -24,6 +24,8 @@ supervisor saw; `llm-setup logs <service>` works for the last session too, also 
 | Start fails right after loading, `Could not find nvcc` with the FlashInfer attention backend | `kv_cache_dtype: fp8` on A100 | Set `kv_cache_dtype: auto`, or install `flashinfer-jit-cache` (PROFILES.md, "Capacity"). |
 | HTTP 400 `"auto" tool choice requires --enable-auto-tool-choice` | the model has no tool-call parser | Set `tool_call_parser` in the profile, restart; `llm-setup smoke` tests it. |
 | `timed out … vllm serve --help=all` or an unsupported flag | start error before any model launched | Raise `LLM_SETUP_VLLM_HELP_TIMEOUT_SECONDS` (default 600, max 3600) if the filesystem is slow; use flags the installed vLLM has. |
+| Job stuck in `CG` long after `scancel`; `srun --jobid <id> --overlap …` hangs or says `aborted before step completely launched` | `sinfo -n <node>` shows `completing` or `completing*` (`*`: slurmd not answering) | A node problem only an admin can clear (Discord admin channel). Do not retry `srun` into the job: each try adds a step that cannot be cancelled. Start elsewhere: `slurm/submit.sh -- --exclude=<node>`. |
+| Start stuck at `installing the compiler Triton needs` | the package mirror is slow | Build the image once with `slurm/build-image.sh`; `submit.sh` then skips `apt-get`. |
 | Allocation about to end | `doctor` warns under an hour left | Save the non-sensitive logs you need; the job stops cleanly 3 minutes before the limit. |
 
 ## Incidents
@@ -38,3 +40,15 @@ Collect profile, versions, logs and latency samples before changing settings; ne
   `ports already in use: gliner :8090`: another user's vLLM had listened on 0.0.0.0:8090 for a day.
   No model had loaded. Fixes: in-job start with absolute paths and `--gres` on the step (now
   `submit.sh --job`), the `GLINER_PORT` override, and a port hint in the start error.
+- **2026-11-22, gammaweb08, jobs 10167 and 10178.** 10167 (CPU `srun --pty bash`) got signal 9 at
+  20:49 and stayed in CG; the node showed `completing*` on and off. Every later
+  `srun --jobid 10178 --overlap` hung (`aborted before step completely launched`), so steps
+  10178.18–31 piled up and could not be cancelled; the stack's log stopped at 20:33 and after
+  `scancel 10178` it was stuck in CG too. Another user's job on the node kept running, so our own
+  processes may have blocked cleanup (unconfirmed; needs an admin to see `D`-state processes). Earlier
+  that evening a SIGKILLed step left our ports held (`ports already in use` on the next start), and a
+  start hung 14 minutes in `apt-get`. Fixes: `terminate()` grace 30 → 20 s (below Slurm `KillWait`
+  30 s), `slurm/build-image.sh` (no `apt-get` at start), the two DEBUGGING rows above.
+  Open: (1) service logs and SQLite are on Ceph (`runtime/`); a Ceph stall can leave a process
+  unkillable, so write them to node-local scratch and copy back on stop; (2) expose health without
+  a new Slurm step; (3) find what 10167 ran and why it got signal 9 (64 GB memory limit?).

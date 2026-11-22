@@ -17,13 +17,17 @@
 #
 # Cluster defaults, overridable in the environment:
 #   LLM_SETUP_PARTITION=gammaweb  LLM_SETUP_GPU_TYPE=ampere
-#   LLM_SETUP_CONTAINER=pytorch/pytorch:2.8.0-cuda12.9-cudnn9-runtime
+#   LLM_SETUP_CONTAINER=runtime/images/pytorch-2.8.0-cuda12.9-gcc.sqsh if built (slurm/build-image.sh),
+#                       else pytorch/pytorch:2.8.0-cuda12.9-cudnn9-runtime
 set -euo pipefail
 here="$(cd "$(dirname "$0")/.." && pwd)"      # absolute: a container does not start in this directory
 
 profile="${LLM_SETUP_PROFILE:-profiles/orch-gliner.yaml}" gpus=3 time=48:00:00 node="" job="" native=0 force=0
 partition="${LLM_SETUP_PARTITION-gammaweb}" gpu_type="${LLM_SETUP_GPU_TYPE:-ampere}"
-image="${LLM_SETUP_CONTAINER:-pytorch/pytorch:2.8.0-cuda12.9-cudnn9-runtime}"
+# Prefer the image from slurm/build-image.sh: it already has the compiler, so no apt-get at start.
+prebuilt="${LLM_SETUP_IMAGE:-$here/runtime/images/pytorch-2.8.0-cuda12.9-gcc.sqsh}"
+if [ -f "$prebuilt" ]; then image="$prebuilt"; else image="pytorch/pytorch:2.8.0-cuda12.9-cudnn9-runtime"; fi
+image="${LLM_SETUP_CONTAINER:-$image}"
 die() { echo "submit.sh: $*" >&2; exit 1; }
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -75,6 +79,7 @@ if [ -n "$job" ]; then
     tail -n 20 "$log" >&2
     die "the step ended at once (wrong --gpus for this job? see $log)"
   fi
+  [ "$native" = 1 ] || echo "container: $image"
   echo "started in job $job (profile $profile, $gpus GPUs)"
   echo "stop it:  scancel $job.<step>   (squeue -s -j $job lists the steps)"
 else

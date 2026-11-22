@@ -236,7 +236,13 @@ def start_optional(session: Session, service: Service, say: Say) -> bool:
         return False
 
 
-def terminate(session: Session, say: Say = print, grace_s: float = 30.0) -> list[str]:
+# Slurm's KillWait on gammaweb is 30 s: after scancel it SIGKILLs every process in the step. Escalate
+# ourselves before that, so vLLM workers are not killed by Slurm mid-teardown (which can leave them
+# unkillable and the job stuck in CG).
+TERMINATE_GRACE_S = 20.0
+
+
+def terminate(session: Session, say: Say = print, grace_s: float = TERMINATE_GRACE_S) -> list[str]:
     """Stop the session's own processes: SIGTERM, then SIGKILL after ``grace_s``."""
     stopped = []
     for service in reversed(list(session.services.values())):
