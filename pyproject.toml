@@ -6,7 +6,7 @@ requires-python = ">=3.11"
 dependencies = ["fastapi>=0.115", "httpx>=0.27", "pyyaml>=6", "uvicorn>=0.30"]
 
 [project.optional-dependencies]
-serve = ["vllm==0.21.0", "litellm[proxy]>=1.92"]
+serve = ["vllm==0.32.0", "litellm[proxy]>=1.92"]
 dev = ["pytest>=8", "ruff>=0.9"]
 # The optional GLiNER service (src/llm_setup/gliner_server.py). Its torch is the one vLLM pins
 # (serve): the two are always installed together, so there is no separate PyTorch index here
