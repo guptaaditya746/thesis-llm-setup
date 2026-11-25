@@ -32,3 +32,4 @@
 - Starting, stopping, the cluster cache, GLiNER, load tests: `docs/OPERATIONS.md`.
 - Changing models, placement or capacity: `docs/PROFILES.md`.
 - Failures, recovery and the incident log: `docs/DEBUGGING.md`.
+- Choosing or benchmarking Webis-hosted LLMs, or checking their API, context, latency or output limits: read `docs/WEBIS-MODELS.md`. Use the authenticated endpoint for experiments; the VPN-only endpoint is documented for demos. Recheck live service facts before relying on them.

@@ -1,0 +1,4 @@
+{"date":"2026-11-25","check":"authenticated_model_catalog","http_status":200,"model_count":29,"qwen3.5-9b_present":true}
+{"date":"2026-11-25","check":"ollama_show","model":"qwen3.5-9b","http_status":200,"parameters":"temperature 0.7; top_p 0.9; top_k 40; num_predict 128","model_info":{},"quantization":"Q4_0","context_field_present":false}
+{"date":"2026-11-25","check":"authenticated_context_probe","model":"qwen3.5-9b","approx_prompt_tokens":2048,"max_tokens":16,"http_status":null,"elapsed_s":45.16,"result":"client read timeout; no usage returned"}
+{"date":"2026-11-25","check":"authenticated_context_probe","model":"qwen3.5-9b","approx_prompt_tokens":4096,"max_tokens":16,"http_status":null,"elapsed_s":45.08,"result":"client read timeout; no usage returned"}
